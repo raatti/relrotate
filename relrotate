@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+# relrotate - logrotate, but for releases.
+#
+# Policy-driven, verified, rollback-capable application updates from
+# GitHub / Gitea / Forgejo releases, for tarballs, single binaries and
+# podman quadlet container tags. One recipe per app, one timer per app.
+#
+# Usage: relrotate <command> [app] [options]
+#   check   <app>          show installed / candidate version, change nothing
+#   update  <app>          update if policy allows (what the timer runs)
+#   rollback <app>         go back to the previous installed version
+#   adopt   <app> <ver>    record the currently installed version (first run)
+#   status  [app]          show state for one or all apps
+#   list                   list configured apps
+#   update-all             run update for every app (sequentially)
+# Options:
+#   -n, --dry-run          download and verify, but do not install or flip
+#   -v, --verbose          debug logging
+#   -h, --help
+
+set -Eeuo pipefail
+shopt -s nullglob
+
+RELROTATE_VERSION="0.2.0"
+
+# Locations (overridable for tests and non-standard installs)
+LIB_DIR="${RELROTATE_LIB_DIR:-}"
+if [[ -z "$LIB_DIR" ]]; then
+    self_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+    if [[ -d "$self_dir/lib" ]]; then
+        LIB_DIR="$self_dir/lib"
+    else
+        LIB_DIR="/usr/local/lib/relrotate"
+    fi
+fi
+CONF_DIR="${RELROTATE_CONF_DIR:-/etc/relrotate}"
+STATE_ROOT="${RELROTATE_STATE_DIR:-/var/lib/relrotate}"
+
+# shellcheck source=lib/common.sh
+. "$LIB_DIR/common.sh"
+# shellcheck source=lib/source.sh
+. "$LIB_DIR/source.sh"
+# shellcheck source=lib/verify.sh
+. "$LIB_DIR/verify.sh"
+# shellcheck source=lib/layout.sh
+. "$LIB_DIR/layout.sh"
+# shellcheck source=lib/transaction.sh
+. "$LIB_DIR/transaction.sh"
+
+usage() {
+    sed -n '2,/^$/{s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"
+}
+
+# ---------------------------------------------------------------- recipe ---
+
+load_recipe() {
+    APP="$1"
+    [[ "$APP" =~ ^[A-Za-z0-9._-]+$ ]] || die 2 "invalid app name: $APP"
+    local recipe="$CONF_DIR/apps.d/$APP.conf"
+    [[ -r "$recipe" ]] || die 2 "no recipe: $recipe"
+
+    # Defaults a recipe may override
+    SOURCE="" TAG_PREFIX="v" VERSION_REGEX="" ALLOW_PRERELEASE="no"
+    ASSET="" VERIFY="" CHECKSUM_ASSET="" GPG_SIG_ASSET="" GPG_KEYRING=""
+    POLICY="minor" MAJOR_ACTION="mail"
+    LAYOUT="" TARGET="" RELEASES_DIR="" STRIP_COMPONENTS="" EXTRACT="auto"
+    ARCHIVE_MEMBER="" OWNER="" MODE="0755" KEEP="3"
+    QUADLET="" QUADLET_USER="" IMAGE="" CONTAINERS=()
+    SERVICE="" RESTART="yes" HEALTH_URL="" HEALTH_RETRIES="5" HEALTH_DELAY="3"
+    LINKS=() COPY=()
+    unset -f pre_update post_extract post_flip healthcheck on_rollback current_version 2>/dev/null || true
+
+    # shellcheck disable=SC1090
+    . "$recipe"
+
+    STATE_DIR="$STATE_ROOT/$APP"
+    mkdir -p "$STATE_DIR"
+    chmod 0750 "$STATE_DIR"
+
+    [[ -n "$SOURCE" ]] || die 2 "$APP: SOURCE is not set"
+    [[ -n "$LAYOUT" ]] || die 2 "$APP: LAYOUT is not set"
+    case "$POLICY" in patch|minor|major) ;; *) die 2 "$APP: POLICY must be patch|minor|major" ;; esac
+    layout_known || die 2 "$APP: LAYOUT must be symlink|binary|container"
+    layout validate
+    ARCH="$(detect_arch)"
+    return 0
+}
+
+installed_version() {
+    if declare -F current_version >/dev/null; then
+        current_version
+        return
+    fi
+    if [[ -s "$STATE_DIR/installed" ]]; then
+        cat "$STATE_DIR/installed"
+        return
+    fi
+    layout detect || true
+}
+
+# --------------------------------------------------------------- commands ---
+
+cmd_check() {
+    load_recipe "$1"
+    local cur; cur="$(installed_version)"
+    fetch_releases
+    local cand; cand="$(pick_candidate "$cur")"
+    local newest; newest="$(newest_version)"
+    printf '%-12s %s\n' app "$APP" installed "${cur:-unknown}" newest "${newest:-none}" \
+        candidate "${cand:-none (policy=$POLICY)}"
+}
+
+cmd_update() {
+    load_recipe "$1"
+    acquire_lock
+    local cur; cur="$(installed_version)"
+    if [[ -z "$cur" ]]; then
+        die 2 "$APP: installed version unknown; run: relrotate adopt $APP <version>"
+    fi
+    OLD_VERSION="$cur"
+    fetch_releases
+    # A dry run only downloads and verifies: no state, no mail.
+    if (( ! DRY_RUN )); then
+        state_set last-check "$(date -Is)"
+        check_major_available "$cur"
+    fi
+
+    local cand; cand="$(pick_candidate "$cur")"
+    (( DRY_RUN )) || clear_stale_skip "$cand"
+    if [[ -z "$cand" ]]; then
+        log info event=up-to-date version="$cur" policy="$POLICY"
+        (( DRY_RUN )) || state_set last-result ok
+        return 0
+    fi
+    VERSION="$cand"
+    TAG="$(tag_for_version "$VERSION")"
+    transaction_apply
+}
+
+cmd_rollback() {
+    load_recipe "$1"
+    acquire_lock
+    local cur prev
+    cur="$(installed_version)"
+    prev="$(cat "$STATE_DIR/previous" 2>/dev/null || true)"
+    [[ -n "$prev" ]] || die 1 "$APP: no previous version recorded"
+    VERSION="$cur" OLD_VERSION="$prev"
+    transaction_rollback
+}
+
+cmd_adopt() {
+    load_recipe "$1"
+    local ver="${2:-}"
+    [[ -n "$ver" ]] || die 2 "usage: relrotate adopt <app> <version>"
+    ver="${ver#"$TAG_PREFIX"}"
+    state_set installed "$ver"
+    log info event=adopted version="$ver"
+    echo "$APP: recorded installed version $ver"
+}
+
+cmd_status() {
+    local apps=()
+    if [[ -n "${1:-}" ]]; then apps=("$1"); else mapfile -t apps < <(list_apps); fi
+    local a
+    for a in "${apps[@]}"; do
+        local d="$STATE_ROOT/$a"
+        printf '%-16s installed=%-12s previous=%-12s last-check=%-26s last=%s\n' "$a" \
+            "$(cat "$d/installed" 2>/dev/null || echo -)" \
+            "$(cat "$d/previous" 2>/dev/null || echo -)" \
+            "$(cat "$d/last-check" 2>/dev/null || echo -)" \
+            "$(cat "$d/last-result" 2>/dev/null || echo -)"
+    done
+}
+
+list_apps() {
+    local f
+    for f in "$CONF_DIR"/apps.d/*.conf; do
+        f="${f##*/}"; printf '%s\n' "${f%.conf}"
+    done
+}
+
+cmd_update_all() {
+    local a rc=0
+    local -a opts=()
+    (( DRY_RUN )) && opts+=(--dry-run)
+    while read -r a; do
+        "${BASH_SOURCE[0]}" update "$a" "${opts[@]+"${opts[@]}"}" || rc=1
+    done < <(list_apps)
+    return "$rc"
+}
+
+# ------------------------------------------------------------------- main ---
+
+DRY_RUN=0
+args=()
+while (( $# )); do
+    case "$1" in
+        -n|--dry-run) DRY_RUN=1 ;;
+        -v|--verbose) RELROTATE_DEBUG=1 ;;
+        -h|--help) usage; exit 0 ;;
+        --version) echo "relrotate $RELROTATE_VERSION"; exit 0 ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+set -- "${args[@]+"${args[@]}"}"
+
+load_global_conf
+require_tools
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+    check)      [[ $# -ge 1 ]] || die 2 "usage: relrotate check <app>"; cmd_check "$1" ;;
+    update)     [[ $# -ge 1 ]] || die 2 "usage: relrotate update <app>"; cmd_update "$1" ;;
+    rollback)   [[ $# -ge 1 ]] || die 2 "usage: relrotate rollback <app>"; cmd_rollback "$1" ;;
+    adopt)      [[ $# -ge 2 ]] || die 2 "usage: relrotate adopt <app> <version>"; cmd_adopt "$1" "$2" ;;
+    status)     cmd_status "${1:-}" ;;
+    list)       list_apps ;;
+    update-all) cmd_update_all ;;
+    ""|help)    usage ;;
+    *)          die 2 "unknown command: $cmd (see relrotate --help)" ;;
+esac

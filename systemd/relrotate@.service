@@ -1,0 +1,27 @@
+[Unit]
+Description=relrotate update run for %i
+Documentation=https://github.com/raatti/relrotate
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/relrotate update %i
+StateDirectory=relrotate
+StateDirectoryMode=0750
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min
+
+# Light hardening only. relrotate installs software as root into places the
+# recipe names (/usr/local/bin, /var/www, quadlet dirs), so a strict sandbox
+# would need per-app ReadWritePaths; see examples/strict.conf for a drop-in.
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+
+# Deliberately NOT set: NoNewPrivileges=yes. Postfix's postdrop is setgid;
+# with NoNewPrivileges the notification mail hangs forever in a retry loop.

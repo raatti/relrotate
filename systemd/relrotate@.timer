@@ -1,0 +1,14 @@
+[Unit]
+Description=relrotate update timer for %i
+Documentation=https://github.com/raatti/relrotate
+
+[Timer]
+# Every 4 hours, spread out so all apps do not hit the APIs at once.
+# Per-app schedule: systemctl edit relrotate@<app>.timer
+OnBootSec=15min
+OnUnitActiveSec=4h
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
