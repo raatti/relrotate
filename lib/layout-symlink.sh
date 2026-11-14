@@ -23,6 +23,15 @@ layout_symlink_stage() {
     fi
     mkdir -p "$RELEASES_DIR"
     RELEASE_DIR="$RELEASES_DIR/$VERSION"
+    # After a failed rollback the new release stays live while state still
+    # names the old one; restaging it would rm -rf the tree being served.
+    if [[ "$(readlink -f "$TARGET")" == "$(readlink -f "$RELEASE_DIR")" ]]; then
+        log err event=state-behind live="$VERSION" recorded="$OLD_VERSION"
+        state_set last-result "refused: $VERSION already live, state says $OLD_VERSION"
+        notify "$VERSION is already live, state says $OLD_VERSION" \
+            "relrotate update $APP: $TARGET already points at $RELEASE_DIR, but the recorded version is $OLD_VERSION (an earlier rollback probably failed). Nothing was changed. Check that $VERSION works, then run: relrotate adopt $APP $VERSION"
+        exit 1
+    fi
     local tmp="$RELEASE_DIR.relrotate-new"
     rm -rf -- "$tmp"
     archive_is_sane "$DOWNLOAD" || return 1
