@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 (2026-11-14)
 
 - symlink layout: refuse to restage a release that is already live. After
   a failed rollback the new release stays live while state still names the
