@@ -238,6 +238,23 @@ check "still restarted and back on 1.2.3" bash -c "grep -q 'restart demo.service
 check "last-result names the hook" grep -q 'on_rollback hook failed' "$T/state/web/last-result"
 check "mail names the hook" grep -q 'on_rollback hook failed' "$T/log/mail"
 
+echo "== candidate already live, state behind (after a failed rollback)"
+# A failed rollback leaves the new release live while state still names the
+# old one, so the next run picks the live version again. Staging it would
+# rm -rf the directory the symlink serves.
+reset_logs; web_install_old; web_recipe minor api-digest
+mkdir -p "$T/www/demo-releases/1.3.0/logs" "$T/state/web"
+echo "demo 1.3.0" > "$T/www/demo-releases/1.3.0/VERSION"
+echo "live" > "$T/www/demo-releases/1.3.0/logs/live.log"
+ln -sfn "$T/www/demo-releases/1.3.0" "$T/www/demo"
+echo 1.2.3 > "$T/state/web/installed"
+check "update refuses" bash -c "! '$RR' update web 2>/dev/null"
+check "symlink still on 1.3.0" test "$(readlink "$T/www/demo")" = "$T/www/demo-releases/1.3.0"
+check "live release dir untouched" test -s "$T/www/demo-releases/1.3.0/logs/live.log"
+check "no restart" bash -c "! grep -q restart '$T/log/systemctl' 2>/dev/null"
+check "state still 1.2.3" test "$(cat "$T/state/web/installed")" = 1.2.3
+check "mail says adopt" grep -q 'relrotate adopt web 1.3.0' "$T/log/mail"
+
 echo "== manual rollback"
 web_on_new() {   # installed 1.3.0, previous 1.2.3, both release dirs present
     reset_logs; web_install_old; web_recipe minor api-digest

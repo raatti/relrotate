@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 (2026-11-14)
+
+- symlink layout: refuse to restage a release that is already live. After
+  a failed rollback the new release stays live while state still names the
+  old version; the next run picked the live version again and `rm -rf`'d the
+  directory being served. Now it changes nothing and mails the
+  `relrotate adopt` command to run.
+
 ## 0.2.0 (2026-11-13)
 
 First public release.
