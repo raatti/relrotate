@@ -17,6 +17,15 @@ Only the latest release gets fixes.
 
 - Recipes are shell sourced as root: whoever can write
   `/etc/relrotate/apps.d/` can run code as root. That is by design.
+- relrotate honours `RELROTATE_*` environment variables (`RELROTATE_LIB_DIR`,
+  `RELROTATE_CURL`, `RELROTATE_SYSTEMCTL`, `RELROTATE_PODMAN`,
+  `RELROTATE_SENDMAIL`, ...) and runs what they name as root. Sudo rules
+  that let a user run relrotate must not keep the caller's environment:
+  no `SETENV`, no `-E`, and no `env_keep` for `RELROTATE_*`.
 - `VERIFY` checks downloaded release assets. Container images are pulled
-  by tag; verify them with a podman signature policy
-  (`containers-policy.json(5)`).
+  by tag (`PIN_DIGEST=yes` then pins what was pulled); verify them with a
+  podman signature policy (`containers-policy.json(5)`).
+- `NOTIFY` destination files hold secrets (a Discord webhook URL, a Telegram
+  bot token): keep them root-only, like the token files. relrotate passes
+  them to curl on stdin and never logs them. Message text comes partly from
+  upstream release data (tags); Discord mentions are disabled.

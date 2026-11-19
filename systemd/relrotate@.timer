@@ -3,10 +3,11 @@ Description=relrotate update timer for %i
 Documentation=https://github.com/raatti/relrotate
 
 [Timer]
-# Every 4 hours, spread out so all apps do not hit the APIs at once.
+# Every 4 hours on the clock; RandomizedDelaySec spreads the apps so they do
+# not all hit the APIs at once. Persistent=true runs a missed trigger once at
+# boot (or when the timer starts) after downtime; it needs OnCalendar=.
 # Per-app schedule: systemctl edit relrotate@<app>.timer
-OnBootSec=15min
-OnUnitActiveSec=4h
+OnCalendar=*-*-* 00/4:00:00
 RandomizedDelaySec=30min
 Persistent=true
 

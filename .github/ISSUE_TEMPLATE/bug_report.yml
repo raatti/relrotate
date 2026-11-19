@@ -1,0 +1,46 @@
+name: Bug report
+description: relrotate did something wrong
+body:
+  - type: input
+    id: version
+    attributes:
+      label: relrotate version
+      description: Output of `relrotate --version`.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: RHEL 10.1, Debian 13, ...
+    validations:
+      required: true
+  - type: dropdown
+    id: layout
+    attributes:
+      label: Layout
+      options: [symlink, binary, container]
+    validations:
+      required: true
+  - type: textarea
+    id: recipe
+    attributes:
+      label: Recipe
+      description: Your `apps.d/<app>.conf`. Remove tokens and anything private.
+      render: bash
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log excerpt
+      description: Relevant lines from `journalctl -u relrotate@<app>` or a `-v` run. No secrets.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+    validations:
+      required: true

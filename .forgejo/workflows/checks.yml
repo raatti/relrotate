@@ -1,25 +1,53 @@
-# Lint and test on every pull request and on pushes to main.
-# runs-on matches the runner's only label (ubuntu-latest, catthehacker
-# Ubuntu 24.04 act image); the checks themselves live in tests/check.sh.
+# Lint on every pull request and push to main; the tests once per release.
+# Tools are installed only when the runner's image lacks them. The checks
+# themselves live in tests/check.sh.
+# actions/checkout v7.0.1 is the same commit on code.forgejo.org and
+# github.com, whichever the instance's DEFAULT_ACTIONS_URL points at.
 name: checks
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
 
 jobs:
-  checks:
+  lint:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') && github.event_name != 'workflow_dispatch' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install tools
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # A no-op once the runner has shellcheck.
+      - name: Install shellcheck if the runner lacks it
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-            shellcheck jq curl bzip2 xz-utils unzip
+          command -v shellcheck >/dev/null || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends shellcheck
+          }
+      - name: Lint
+        run: tests/check.sh lint
 
+  # Minutes on the runner: a release tag or the "run workflow" button only.
+  tests:
+    if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the tools the runner lacks
+        run: |
+          for t in shellcheck jq curl bzip2 xz unzip zip; do
+            command -v "$t" >/dev/null && continue
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends \
+              shellcheck jq curl bzip2 xz-utils unzip zip
+            break
+          done
       - name: Lint and test
         run: tests/check.sh

@@ -10,18 +10,23 @@
 #   update  <app>          update if policy allows (what the timer runs)
 #   rollback <app>         go back to the previous installed version
 #   adopt   <app> <ver>    record the currently installed version (first run)
-#   status  [app]          show state for one or all apps
+#   hold    <app> [reason] keep the app on its version until unhold
+#   unhold  <app>          let updates run again
+#   status  [app]          show state for one or all apps (--json for scripts)
+#   doctor  [app]          check recipes, releases and paths; change nothing
 #   list                   list configured apps
 #   update-all             run update for every app (sequentially)
+#   digest                 send the summary of queued notifications
 # Options:
 #   -n, --dry-run          download and verify, but do not install or flip
+#   --json                 status: one JSON array
 #   -v, --verbose          debug logging
 #   -h, --help
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-RELROTATE_VERSION="0.2.0"
+RELROTATE_VERSION="0.3.0"
 
 # Locations (overridable for tests and non-standard installs)
 LIB_DIR="${RELROTATE_LIB_DIR:-}"
@@ -29,6 +34,8 @@ if [[ -z "$LIB_DIR" ]]; then
     self_dir="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
     if [[ -d "$self_dir/lib" ]]; then
         LIB_DIR="$self_dir/lib"
+    elif [[ -d "$self_dir/../lib/relrotate" ]]; then   # install.sh: PREFIX/sbin, PREFIX/lib/relrotate
+        LIB_DIR="$self_dir/../lib/relrotate"
     else
         LIB_DIR="/usr/local/lib/relrotate"
     fi
@@ -38,14 +45,22 @@ STATE_ROOT="${RELROTATE_STATE_DIR:-/var/lib/relrotate}"
 
 # shellcheck source=lib/common.sh
 . "$LIB_DIR/common.sh"
+# shellcheck source=lib/notify.sh
+. "$LIB_DIR/notify.sh"
+# shellcheck source=lib/state.sh
+. "$LIB_DIR/state.sh"
 # shellcheck source=lib/source.sh
 . "$LIB_DIR/source.sh"
 # shellcheck source=lib/verify.sh
 . "$LIB_DIR/verify.sh"
 # shellcheck source=lib/layout.sh
 . "$LIB_DIR/layout.sh"
+# shellcheck source=lib/outcome.sh
+. "$LIB_DIR/outcome.sh"
 # shellcheck source=lib/transaction.sh
 . "$LIB_DIR/transaction.sh"
+# shellcheck source=lib/backup.sh
+. "$LIB_DIR/backup.sh"
 
 usage() {
     sed -n '2,/^$/{s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"
@@ -53,19 +68,26 @@ usage() {
 
 # ---------------------------------------------------------------- recipe ---
 
+# Must not start with a dot: "." and ".." would make STATE_DIR the parent.
+valid_app_name() { [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; }
+
 load_recipe() {
     APP="$1"
-    [[ "$APP" =~ ^[A-Za-z0-9._-]+$ ]] || die 2 "invalid app name: $APP"
+    valid_app_name "$APP" || die 2 "invalid app name: $APP"
     local recipe="$CONF_DIR/apps.d/$APP.conf"
     [[ -r "$recipe" ]] || die 2 "no recipe: $recipe"
 
-    # Defaults a recipe may override
+    # Defaults a recipe may override. Layout-specific ones (QUADLET, CONTAINERS,
+    # LINKS, ...) stay here: the layout is only known after the recipe is
+    # sourced, and a recipe may append to them (LINKS+=(...)) or its hooks read
+    # them under set -u whatever the layout.
     SOURCE="" TAG_PREFIX="v" VERSION_REGEX="" ALLOW_PRERELEASE="no"
     ASSET="" VERIFY="" CHECKSUM_ASSET="" GPG_SIG_ASSET="" GPG_KEYRING=""
     POLICY="minor" MAJOR_ACTION="mail"
     LAYOUT="" TARGET="" RELEASES_DIR="" STRIP_COMPONENTS="" EXTRACT="auto"
     ARCHIVE_MEMBER="" OWNER="" MODE="0755" KEEP="3"
-    QUADLET="" QUADLET_USER="" IMAGE="" CONTAINERS=()
+    QUADLET="" QUADLET_USER="" IMAGE="" CONTAINERS=() PIN_DIGEST="no" CHECKSUM_SIG_ASSET=""
+    BACKUP_DIR="" BACKUP_KEEP="5"
     SERVICE="" RESTART="yes" HEALTH_URL="" HEALTH_RETRIES="5" HEALTH_DELAY="3"
     LINKS=() COPY=()
     unset -f pre_update post_extract post_flip healthcheck on_rollback current_version 2>/dev/null || true
@@ -80,44 +102,76 @@ load_recipe() {
     [[ -n "$SOURCE" ]] || die 2 "$APP: SOURCE is not set"
     [[ -n "$LAYOUT" ]] || die 2 "$APP: LAYOUT is not set"
     case "$POLICY" in patch|minor|major) ;; *) die 2 "$APP: POLICY must be patch|minor|major" ;; esac
+    [[ "$HEALTH_RETRIES" =~ ^[1-9][0-9]*$ ]] || die 2 "$APP: HEALTH_RETRIES must be a whole number, 1 or more"
+    [[ "$HEALTH_DELAY" =~ ^[0-9]+(\.[0-9]+)?[smhd]?$ ]] || die 2 "$APP: HEALTH_DELAY must be a sleep duration (5, 2.5, 30s, 1m)"
+    [[ "$KEEP" =~ ^[1-9][0-9]*$ ]] || die 2 "$APP: KEEP must be a whole number, 1 or more"
+    [[ "$MIN_AGE_DAYS" =~ ^(0|[1-9][0-9]*)$ ]] || die 2 "$APP: MIN_AGE_DAYS must be a whole number of days"
+    case "$PIN_DIGEST" in yes|no) ;; *) die 2 "$APP: PIN_DIGEST must be yes or no" ;; esac
+    [[ "$BACKUP_KEEP" =~ ^[1-9][0-9]*$ ]] || die 2 "$APP: BACKUP_KEEP must be a whole number, 1 or more"
+    [[ -z "$BACKUP_DIR" || "$BACKUP_DIR" == /* ]] || die 2 "$APP: BACKUP_DIR must be an absolute path"
     layout_known || die 2 "$APP: LAYOUT must be symlink|binary|container"
     layout validate
     ARCH="$(detect_arch)"
     return 0
 }
 
+# installed_version: print the installed version, cleaned (clean_version);
+# nothing when unknown. Returns 1 when current_version fails, 2 when what it
+# or the state says is not a version; both log why.
 installed_version() {
+    local v
     if declare -F current_version >/dev/null; then
-        current_version
-        return
+        v="$(current_version 9>&-)" || { log err msg="current_version failed; cannot tell what is installed"; return 1; }
+    elif state_has installed; then
+        v="$(state_get installed)"
+    else
+        v="$(layout detect || true)"
     fi
-    if [[ -s "$STATE_DIR/installed" ]]; then
-        cat "$STATE_DIR/installed"
-        return
-    fi
-    layout detect || true
+    [[ -n "${v//[[:space:]]/}" ]] || return 0
+    clean_version "$v" || { log err msg="installed version is not a version: $v"; return 2; }
 }
 
 # --------------------------------------------------------------- commands ---
 
 cmd_check() {
     load_recipe "$1"
-    local cur; cur="$(installed_version)"
+    local cur; cur="$(installed_version)" || exit $?
     fetch_releases
-    local cand; cand="$(pick_candidate "$cur")"
+    pick_candidate "$cur"
     local newest; newest="$(newest_version)"
     printf '%-12s %s\n' app "$APP" installed "${cur:-unknown}" newest "${newest:-none}" \
-        candidate "${cand:-none (policy=$POLICY)}"
+        candidate "${CANDIDATE:-none (policy=$POLICY)}"
+    [[ -z "$WAITING" ]] || printf '%-12s %s\n' waiting "$WAITING until $(release_ripe_at "$WAITING") (MIN_AGE_DAYS=$MIN_AGE_DAYS)"
+    ! state_has held || printf '%-12s %s\n' held "$(state_get held)"
 }
 
 cmd_update() {
     load_recipe "$1"
     acquire_lock
-    local cur; cur="$(installed_version)"
+    local cur; cur="$(installed_version)" || exit $?
     if [[ -z "$cur" ]]; then
         die 2 "$APP: installed version unknown; run: relrotate adopt $APP <version>"
     fi
+    local blocked
+    if blocked="$(state_blocked)"; then
+        die 1 "$APP: a rollback to $blocked is incomplete; updates are blocked. Fix the cause and run: relrotate rollback $APP"
+    fi
     OLD_VERSION="$cur"
+    # A live version recorded as unhealthy is checked again first, so the
+    # record follows what runs; while it fails, nothing records plain "ok".
+    local still_unhealthy=0 recovered=0
+    if state_has unhealthy && (( ! DRY_RUN )); then
+        run_healthcheck
+        # A plain statement, so a failed state write still stops the run.
+        outcome_recheck "$cur"
+        if (( HEALTHY )); then recovered=1; else still_unhealthy=1; fi
+    fi
+    if state_has held; then
+        log info event=held reason="$(state_get held)"
+        (( ! still_unhealthy )) || return 1
+        return 0
+    fi
+    (( DRY_RUN )) || RECORD_FETCH_FAILURE=1
     fetch_releases
     # A dry run only downloads and verifies: no state, no mail.
     if (( ! DRY_RUN )); then
@@ -125,11 +179,17 @@ cmd_update() {
         check_major_available "$cur"
     fi
 
-    local cand; cand="$(pick_candidate "$cur")"
-    (( DRY_RUN )) || clear_stale_skip "$cand"
+    pick_candidate "$cur"
+    local cand="$CANDIDATE"
+    if (( ! DRY_RUN )); then
+        clear_stale_skip "$cand"
+        if [[ -n "$WAITING" ]]; then state_set waiting "$WAITING $(release_ripe_at "$WAITING")"
+        else state_clear waiting; fi
+    fi
     if [[ -z "$cand" ]]; then
         log info event=up-to-date version="$cur" policy="$POLICY"
-        (( DRY_RUN )) || state_set last-result ok
+        (( ! still_unhealthy )) || return 1   # keep the UNHEALTHY record
+        (( DRY_RUN || recovered )) || state_set last-result ok
         return 0
     fi
     VERSION="$cand"
@@ -141,8 +201,13 @@ cmd_rollback() {
     load_recipe "$1"
     acquire_lock
     local cur prev
-    cur="$(installed_version)"
-    prev="$(cat "$STATE_DIR/previous" 2>/dev/null || true)"
+    # Rollback is for a broken app: when current_version fails, use the recorded version.
+    cur="$(installed_version)" || {
+        log warning msg="installed version unreadable; using the recorded one"
+        cur="$(clean_version "$(state_get installed)")" || cur=""
+    }
+    # An incomplete revert is retried first, towards the version it was going to.
+    prev="$(state_blocked)" || prev="$(state_get previous)"
     [[ -n "$prev" ]] || die 1 "$APP: no previous version recorded"
     VERSION="$cur" OLD_VERSION="$prev"
     transaction_rollback
@@ -150,27 +215,235 @@ cmd_rollback() {
 
 cmd_adopt() {
     load_recipe "$1"
+    acquire_lock
     local ver="${2:-}"
     [[ -n "$ver" ]] || die 2 "usage: relrotate adopt <app> <version>"
     ver="${ver#"$TAG_PREFIX"}"
+    ver="$(clean_version "$ver")" || die 2 "$APP: not a version: $2"
     state_set installed "$ver"
+    state_clear incomplete unhealthy failed-notified   # the admin vouches for the files now
     log info event=adopted version="$ver"
     echo "$APP: recorded installed version $ver"
 }
 
+# hold APP [REASON]: no updates until unhold. Rollback and adopt still work.
+cmd_hold() {
+    load_recipe "$1"
+    acquire_lock
+    local why="${2:-held by hand}"
+    state_set held "${why//$'\n'/ } (since $(date -Is))"
+    log info event=hold reason="$why"
+    echo "$APP: held; updates are skipped until: relrotate unhold $APP"
+}
+
+cmd_unhold() {
+    load_recipe "$1"
+    acquire_lock
+    state_has held || { echo "$APP: not held"; return 0; }
+    state_clear held
+    log info event=unhold
+    echo "$APP: updates run again"
+}
+
+# One app's state as JSON; the text status is printed from it.
+status_json() {
+    local STATE_DIR="$STATE_ROOT/$1" f
+    local -a args=(--arg app "$1")
+    for f in installed previous last-check last-result incomplete unhealthy held skip check-failed waiting; do
+        if state_has "$f"; then args+=(--arg "${f//-/_}" "$(state_get "$f")")
+        else args+=(--argjson "${f//-/_}" null); fi
+    done
+    jq -nc "${args[@]}" '{app: $app, installed: $installed, previous: $previous,
+        last_check: $last_check, last_result: $last_result, incomplete: $incomplete,
+        unhealthy: $unhealthy, held: $held, skip: $skip, check_failed: $check_failed,
+        waiting: $waiting}'
+}
+
 cmd_status() {
     local apps=()
-    if [[ -n "${1:-}" ]]; then apps=("$1"); else mapfile -t apps < <(list_apps); fi
+    if [[ -n "${1:-}" ]]; then
+        valid_app_name "$1" || die 2 "invalid app name: $1"
+        apps=("$1")
+    else mapfile -t apps < <(list_apps); fi
     local a
+    if (( JSON )); then
+        for a in "${apps[@]}"; do status_json "$a"; done | jq -s .
+        return 0
+    fi
     for a in "${apps[@]}"; do
-        local d="$STATE_ROOT/$a"
-        printf '%-16s installed=%-12s previous=%-12s last-check=%-26s last=%s\n' "$a" \
-            "$(cat "$d/installed" 2>/dev/null || echo -)" \
-            "$(cat "$d/previous" 2>/dev/null || echo -)" \
-            "$(cat "$d/last-check" 2>/dev/null || echo -)" \
-            "$(cat "$d/last-result" 2>/dev/null || echo -)"
+        # Flags go before last=, which stays the free-text end of the line.
+        status_json "$a" | jq -r '
+            def v: . // "-";
+            ([ (select(.incomplete) | "INCOMPLETE(rollback to \(.incomplete))"),
+               (select(.unhealthy) | "UNHEALTHY(\(.unhealthy))"),
+               (select(.held) | "HELD(\(.held))"),
+               (select(.check_failed) | "CHECK-FAILED"),
+               (select(.skip) | "SKIP(\(.skip))"),
+               (select(.waiting) | "WAITING(\(.waiting | sub(" "; " until ")))") ]
+             | map(" " + .) | join("")) as $flags
+            | "\(.app | . + " " * ([16 - length, 0] | max)) installed=\(.installed | v | . + " " * ([12 - length, 0] | max)) previous=\(.previous | v | . + " " * ([12 - length, 0] | max)) last-check=\(.last_check | v | . + " " * ([26 - length, 0] | max))\($flags) last=\(.last_result | v)"'
     done
 }
+
+# doctor [APP]: what an update would trip over, without changing anything.
+cmd_doctor() {
+    local apps=() a rc=0
+    if [[ -n "${1:-}" ]]; then apps=("$1"); else mapfile -t apps < <(list_apps); fi
+    (( ${#apps[@]} )) || { echo "no recipes in $CONF_DIR/apps.d"; return 1; }
+    doctor_global || rc=1
+    for a in "${apps[@]}"; do
+        echo "$a:"
+        # A subshell per app: a recipe that fails to load exits it, not doctor.
+        ( doctor_app "$a" ) || rc=1
+    done
+    return "$rc"
+}
+
+doctor_ok()   { printf '  ok    %s\n' "$*"; }
+doctor_bad()  { printf '  FAIL  %s\n' "$*"; DOCTOR_RC=1; }
+doctor_note() { printf '  note  %s\n' "$*"; }
+
+# doctor_perm WHAT PATH [secret]: PATH (the target of a symlink, said so) is owned
+# by root or by the invoking user, and not writable by group or
+# others; a secret file is not readable by them either. A missing file is no finding.
+doctor_perm() {
+    local what="$1" p="$2" t="$2" owner mode bits=022 problem=""
+    [[ -e "$p" ]] || return 0
+    [[ "${3:-}" != secret ]] || bits=077
+    if [[ -L "$p" ]]; then
+        t="$(readlink -f "$p")"; doctor_note "$what $p is a symlink to $t"
+    fi
+    read -r owner mode < <(stat -Lc '%u %a' "$p")
+    if (( owner != 0 && owner != EUID )); then problem="owned by uid $owner, expected root or $EUID"
+    elif (( 8#$mode & bits )); then
+        problem="group or others can $( (( 8#$mode & 022 )) && echo write || echo read) (mode $mode)"
+    fi
+    if [[ -n "$problem" ]]; then doctor_bad "$what $t: $problem"; else doctor_ok "$what $t"; fi
+}
+
+doctor_global() {
+    DOCTOR_RC=0
+    doctor_perm "config dir" "$CONF_DIR"
+    doctor_perm apps.d "$CONF_DIR/apps.d"
+    doctor_perm relrotate.conf "$CONF_DIR/relrotate.conf"
+    DOCTOR_TOKENS="$GITHUB_TOKEN_FILE $GITEA_TOKEN_FILE"   # a recipe may set its own
+    local t
+    for t in "$GITHUB_TOKEN_FILE" "$GITEA_TOKEN_FILE"; do
+        [[ -z "$t" ]] || doctor_perm "token file" "$t" secret
+    done
+    echo "notifications:"
+    if [[ -n "$MAIL_TO" ]]; then
+        if [[ -n "$SENDMAIL" && -x "$SENDMAIL" ]]; then doctor_ok "mail to $MAIL_TO via $SENDMAIL"
+        else doctor_bad "MAIL_TO is set but no sendmail found"; fi
+    fi
+    local d
+    for d in "${NOTIFY[@]+"${NOTIFY[@]}"}"; do
+        if [[ -r "${d#*:}" ]]; then doctor_ok "${d%%:*} destination file readable"
+        else doctor_bad "${d%%:*} destination file not readable: ${d#*:}"; fi
+        doctor_perm "notify file" "${d#*:}" secret
+    done
+    [[ -n "$MAIL_TO" ]] || (( ${#NOTIFY[@]} )) || doctor_note "no MAIL_TO or NOTIFY: results go to the journal only"
+    [[ "$NOTIFY_POLICY" == each ]] || doctor_note "NOTIFY_POLICY=$NOTIFY_POLICY: enable relrotate-digest.timer, or queued events are never sent"
+    return "$DOCTOR_RC"
+}
+
+doctor_app() {
+    DOCTOR_RC=0
+    local err
+    # Twice on purpose: the subshell turns a die/exit in load_recipe into a
+    # finding; the second call (cheap, no network) sets the variables here.
+    if ! err="$( (load_recipe "$1") 2>&1 >/dev/null)"; then
+        doctor_bad "recipe does not load: ${err##*msg=}"; exit 1
+    fi
+    load_recipe "$1"
+    doctor_ok "recipe loads (layout=$LAYOUT, policy=$POLICY)"
+    doctor_perm recipe "$CONF_DIR/apps.d/$APP.conf"
+    local t
+    for t in "$GITHUB_TOKEN_FILE" "$GITEA_TOKEN_FILE"; do
+        [[ -z "$t" || " $DOCTOR_TOKENS " == *" $t "* ]] || doctor_perm "token file" "$t" secret
+    done
+    local cur rc=0
+    cur="$(installed_version)" || rc=$?
+    if (( rc == 1 )); then doctor_bad "current_version failed; cannot tell what is installed"; cur=""
+    elif (( rc )); then doctor_bad "installed version is not a version (see the log line above)"; cur=""
+    elif [[ -n "$cur" ]]; then doctor_ok "installed version $cur"
+    else doctor_bad "installed version unknown; run: relrotate adopt $APP <version>"; fi
+    local blocked
+    ! blocked="$(state_blocked)" || doctor_bad "updates blocked: rollback to $blocked incomplete"
+    ! state_has unhealthy || doctor_bad "$(state_get unhealthy) recorded as unhealthy"
+    ! state_has held || doctor_note "held: $(state_get held)"
+    doctor_paths
+    doctor_backups
+    # fetch_releases exits on failure: run it in a subshell, keep its result
+    # and its stderr (the reason, last line on failure), so one request serves both.
+    local out
+    if out="$(fetch_releases 2>&1; printf '\n@@%s' "$RELEASES")"; then
+        RELEASES="${out##*$'\n'@@}"
+    else
+        err="${out##*$'\n'}"
+        doctor_bad "release check fails: ${err##*msg=}"; exit 1
+    fi
+    local newest; newest="$(newest_version)"
+    doctor_ok "release check: newest $newest"
+    if layout needs_download; then doctor_release "$newest"; fi
+    pick_candidate "$cur" 2>/dev/null
+    if [[ -n "$CANDIDATE" ]]; then doctor_note "next update installs $CANDIDATE"
+    elif [[ -n "$WAITING" ]]; then doctor_note "$WAITING waits until $(release_ripe_at "$WAITING")"; fi
+    exit "$DOCTOR_RC"
+}
+
+# The files the newest release must carry for this recipe's ASSET and VERIFY.
+doctor_release() {
+    local VERSION="$1" TAG name m f
+    # shellcheck disable=SC2034  # read by expand
+    TAG="$(tag_for_version "$VERSION")"
+    name="$(expand "$ASSET")"
+    if [[ -n "$(asset_field "$name" url)" ]]; then doctor_ok "asset $name in $VERSION"
+    else doctor_bad "asset $name not in release $VERSION (renamed upstream?)"; fi
+    [[ -n "$VERIFY" ]] || doctor_bad "VERIFY is not set"
+    for m in $VERIFY; do
+        # verify.sh owns the method list and what each needs; this only reports it.
+        verify_known "$m" || { doctor_bad "unknown VERIFY method $m"; continue; }
+        case "$m" in
+            api-digest)
+                if [[ "$(asset_field "$name" digest)" == sha256:* ]]; then doctor_ok "API digest for $name"
+                else doctor_bad "release API gives no sha256 digest for $name"; fi ;;
+            checksums-file) [[ -n "$CHECKSUM_ASSET" ]] || doctor_bad "VERIFY=checksums-file needs CHECKSUM_ASSET" ;;
+            none) doctor_note "VERIFY=none: downloads are not verified" ;;
+        esac
+        while IFS= read -r f; do doctor_asset "$f"; done < <(verify_needs "$name" "$m")
+        case "$m:${CHECKSUM_SIG_ASSET:+sig}" in gpg:*|checksums-file:sig) doctor_gpg ;; esac
+    done
+}
+doctor_asset() {
+    if [[ -n "$(asset_field "$1" url)" ]]; then doctor_ok "$1 in $VERSION"
+    else doctor_bad "$1 not in release $VERSION"; fi
+}
+doctor_gpg() {
+    command -v gpgv >/dev/null 2>&1 || doctor_bad "gpgv is not installed"
+    if [[ "$GPG_KEYRING" == /* && -r "$GPG_KEYRING" ]]; then doctor_ok "keyring $GPG_KEYRING"
+    else doctor_bad "GPG_KEYRING must be an absolute path to a readable file: '$GPG_KEYRING'"; fi
+    [[ "$GPG_KEYRING" != /* ]] || doctor_perm keyring "$GPG_KEYRING"
+}
+
+# Hooks that call a backup helper need its tool.
+doctor_backups() {
+    local hooks; hooks="$(declare -f pre_update post_extract post_flip 2>/dev/null || true)"
+    if [[ "$hooks" == *backup_sqlite* ]]; then
+        if command -v sqlite3 >/dev/null 2>&1; then doctor_ok "sqlite3 for backup_sqlite"
+        else doctor_bad "a hook calls backup_sqlite but sqlite3 is not installed"; fi
+    fi
+    if [[ "$hooks" == *backup_pg* ]]; then
+        if command -v "$PODMAN" >/dev/null 2>&1; then doctor_ok "podman for backup_pg"
+        else doctor_bad "a hook calls backup_pg but podman is not installed"; fi
+    fi
+    [[ "$hooks" != *backup_* ]] || doctor_note "backups go to ${BACKUP_DIR:-$STATE_DIR/backups} (newest $BACKUP_KEEP kept)"
+}
+
+doctor_paths() { layout doctor; }
+
+# digest: send everything queued as one message (lib/notify.sh).
+cmd_digest() { digest_flush; }
 
 list_apps() {
     local f
@@ -183,22 +456,30 @@ cmd_update_all() {
     local a rc=0
     local -a opts=()
     (( DRY_RUN )) && opts+=(--dry-run)
+    [[ "$RELROTATE_DEBUG" == 1 ]] && opts+=(-v)
     while read -r a; do
-        "${BASH_SOURCE[0]}" update "$a" "${opts[@]+"${opts[@]}"}" || rc=1
+        # </dev/null: a hook reading stdin must not eat the app list
+        "${BASH_SOURCE[0]}" update "$a" "${opts[@]+"${opts[@]}"}" </dev/null || rc=1
     done < <(list_apps)
+    # One summary for the whole run instead of one message per app.
+    if notify_digest_wanted && (( ! DRY_RUN )); then cmd_digest || true; fi
     return "$rc"
 }
 
 # ------------------------------------------------------------------- main ---
 
-DRY_RUN=0
+usage_err() { log err msg="$1"; usage >&2; exit 2; }
+
+DRY_RUN=0 JSON=0
 args=()
 while (( $# )); do
     case "$1" in
         -n|--dry-run) DRY_RUN=1 ;;
         -v|--verbose) RELROTATE_DEBUG=1 ;;
+        --json) JSON=1 ;;
         -h|--help) usage; exit 0 ;;
         --version) echo "relrotate $RELROTATE_VERSION"; exit 0 ;;
+        -*) usage_err "unknown option: $1" ;;
         *) args+=("$1") ;;
     esac
     shift
@@ -209,14 +490,24 @@ load_global_conf
 require_tools
 
 cmd="${1:-}"; shift || true
+# -n would be silently ignored here, and these commands write state.
 case "$cmd" in
-    check)      [[ $# -ge 1 ]] || die 2 "usage: relrotate check <app>"; cmd_check "$1" ;;
-    update)     [[ $# -ge 1 ]] || die 2 "usage: relrotate update <app>"; cmd_update "$1" ;;
-    rollback)   [[ $# -ge 1 ]] || die 2 "usage: relrotate rollback <app>"; cmd_rollback "$1" ;;
-    adopt)      [[ $# -ge 2 ]] || die 2 "usage: relrotate adopt <app> <version>"; cmd_adopt "$1" "$2" ;;
-    status)     cmd_status "${1:-}" ;;
-    list)       list_apps ;;
-    update-all) cmd_update_all ;;
-    ""|help)    usage ;;
-    *)          die 2 "unknown command: $cmd (see relrotate --help)" ;;
+    adopt|rollback|hold|unhold|digest) (( ! DRY_RUN )) || usage_err "$cmd has no --dry-run" ;;
+esac
+[[ "$cmd" == status ]] || (( ! JSON )) || usage_err "--json is for status only"
+case "$cmd" in
+    check)      [[ $# -eq 1 ]] || usage_err "usage: relrotate check <app>"; cmd_check "$1" ;;
+    update)     [[ $# -eq 1 ]] || usage_err "usage: relrotate update <app>"; cmd_update "$1" ;;
+    rollback)   [[ $# -eq 1 ]] || usage_err "usage: relrotate rollback <app>"; cmd_rollback "$1" ;;
+    adopt)      [[ $# -eq 2 ]] || usage_err "usage: relrotate adopt <app> <version>"; cmd_adopt "$1" "$2" ;;
+    hold)       [[ $# -ge 1 && $# -le 2 ]] || usage_err "usage: relrotate hold <app> [reason]"; cmd_hold "$1" "${2:-}" ;;
+    unhold)     [[ $# -eq 1 ]] || usage_err "usage: relrotate unhold <app>"; cmd_unhold "$1" ;;
+    status)     [[ $# -le 1 ]] || usage_err "usage: relrotate status [app]"; cmd_status "${1:-}" ;;
+    doctor)     [[ $# -le 1 ]] || usage_err "usage: relrotate doctor [app]"; cmd_doctor "${1:-}" ;;
+    digest)     [[ $# -eq 0 ]] || usage_err "usage: relrotate digest"; cmd_digest ;;
+    list)       [[ $# -eq 0 ]] || usage_err "usage: relrotate list"; list_apps ;;
+    update-all) [[ $# -eq 0 ]] || usage_err "usage: relrotate update-all"; cmd_update_all ;;
+    help)       usage ;;
+    "")         usage_err "no command given" ;;
+    *)          usage_err "unknown command: $cmd" ;;
 esac

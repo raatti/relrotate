@@ -1,5 +1,6 @@
 # shellcheck shell=bash
 # shellcheck disable=SC2153  # recipe variables are set in load_recipe()
+# shellcheck disable=SC2034  # REVERT_* are read in lib/outcome.sh
 # relrotate: the update and rollback transactions.
 #
 #   transaction_apply      install VERSION over OLD_VERSION (what update runs)
@@ -8,32 +9,42 @@
 # The rule: before the flip, a failure changes nothing and says so; after
 # the flip, every failure reverts. A revert carries on past a failing
 # on_rollback hook, restart or health check and reports all of them.
-# installed, previous, skip and last-result change only here (and adopt).
-
-# state_set NAME VALUE: atomic write of one state file; every state write
-# goes through it, so a crash never leaves an empty "installed".
-state_set() {
-    printf '%s\n' "$2" > "$STATE_DIR/$1.tmp" && mv -f "$STATE_DIR/$1.tmp" "$STATE_DIR/$1"
-}
+# The transactions run the steps; lib/outcome.sh decides what to record and
+# who to tell. installed, previous, skip, incomplete, unhealthy and last-result
+# change only there (and in adopt).
+# "incomplete" holds the version a partial revert was going to; while it
+# exists updates refuse and rollback retries that revert.
+# "unhealthy" names a live version whose health check failed; while it
+# exists every update run checks health again and never records plain "ok".
 
 # revert_to VER: make VER live, then hook, restart, health check.
-# Sets REVERT_SWITCHED=1 once the files are on VER and REVERT_PROBLEMS to a
-# "; "-joined list of what failed. Returns 0 only if nothing failed.
+# layout revert returns 0 done, 1 nothing changed, 2 changed but incomplete.
+# Sets REVERT_SWITCHED=1 once files changed, REVERT_INCOMPLETE=1 when the layout
+# changed files but did not finish (rc 2), REVERT_UNHEALTHY=1 when the health
+# check failed, and REVERT_PROBLEMS to a "; "-joined list of what failed (empty:
+# nothing failed). lib/outcome.sh turns these into markers, record and alert. Always returns 0, and must be
+# called as a plain statement: its hooks run with errexit (see run_hook).
 revert_to() {
     local to="$1"
-    REVERT_SWITCHED=0 REVERT_PROBLEMS=""
-    if ! layout revert "$to"; then
-        REVERT_PROBLEMS="switching back to $to failed"
-        return 1
-    fi
+    REVERT_SWITCHED=0 REVERT_INCOMPLETE=0 REVERT_UNHEALTHY=0 REVERT_PROBLEMS=""
+    local rc=0
+    layout revert "$to" || rc=$?
+    case "$rc" in
+        0) ;;
+        2) REVERT_INCOMPLETE=1
+           revert_problem "switching back to $to incomplete" ;;
+        *) REVERT_PROBLEMS="switching back to $to failed"; return 0 ;;
+    esac
     REVERT_SWITCHED=1
-    if declare -F on_rollback >/dev/null && ! on_rollback; then
-        log err msg="on_rollback hook failed"
+    run_hook on_rollback
+    if (( HOOK_RC != 0 )); then
+        log err msg="on_rollback hook failed" rc="$HOOK_RC"
         revert_problem "on_rollback hook failed"
     fi
-    restart_service || revert_problem "restart failed"
-    run_healthcheck || revert_problem "health check failed"
-    [[ -z "$REVERT_PROBLEMS" ]]
+    restart_service all || revert_problem "restart failed"
+    run_healthcheck
+    (( HEALTHY )) || { REVERT_UNHEALTHY=1; revert_problem "health check failed"; }
+    return 0
 }
 revert_problem() { REVERT_PROBLEMS+="${REVERT_PROBLEMS:+; }$1"; }
 
@@ -42,9 +53,7 @@ fail_update() {
     local reason="$1"
     log err event=update-failed version="${VERSION:-?}" reason="$reason"
     (( ! DRY_RUN )) || exit 1
-    state_set last-result "failed ${VERSION:-?} ($reason), nothing changed"
-    notify "update to ${VERSION:-?} failed before install" \
-        "relrotate could not update $APP to ${VERSION:-?}: $reason. Nothing was changed; $OLD_VERSION is still running. It will retry on the next timer run."
+    outcome_nothing_changed "$reason"
     exit 1
 }
 
@@ -53,26 +62,47 @@ fail_update() {
 revert_update() {
     local reason="$1"
     log err event=rollback reason="$reason" from="$VERSION" to="$OLD_VERSION"
-    if revert_to "$OLD_VERSION"; then
-        state_set last-result "failed $VERSION ($reason), rolled back to $OLD_VERSION"
-        notify "FAILED $VERSION, rolled back to $OLD_VERSION" \
-            "relrotate tried to update $APP to $VERSION and it failed: $reason. Rolled back to $OLD_VERSION and the health check passes. Nothing else to do unless it keeps happening."
-    elif (( REVERT_SWITCHED )) && [[ "$REVERT_PROBLEMS" != *"health check failed"* ]]; then
-        state_set last-result "failed $VERSION ($reason), rolled back to $OLD_VERSION; $REVERT_PROBLEMS"
-        notify "FAILED $VERSION, rolled back to $OLD_VERSION with problems" \
-            "relrotate tried to update $APP to $VERSION and it failed: $reason. Rolled back to $OLD_VERSION and the health check passes, but: $REVERT_PROBLEMS. Check what the hook was meant to do."
-    else
-        state_set last-result "failed $VERSION ($reason), ROLLBACK ALSO FAILED: $REVERT_PROBLEMS"
-        notify "FAILED $VERSION and ROLLBACK FAILED" \
-            "relrotate tried to update $APP to $VERSION and it failed: $reason. Rolling back to $OLD_VERSION did not bring it back healthy: $REVERT_PROBLEMS. Manual attention needed."
-    fi
+    revert_to "$OLD_VERSION"
+    outcome_update_reverted "$reason"
     return 1
 }
 
+# TERM/INT (systemctl stop, TimeoutStartSec) during an update or rollback.
+# TXN_PHASE: pre (nothing changed yet), switched (files may be between
+# OLD_VERSION and VERSION), done (the outcome is recorded). Writing
+# last-result is the commit point of every outcome, so commit_result moves
+# to done and a later signal (say during the mail) leaves the record alone.
+TXN_PHASE=pre
+commit_result() { state_set last-result "$1"; TXN_PHASE="done"; }
+on_signal() {
+    local sig="$1" rc=143; [[ "$sig" == INT ]] && rc=130
+    log err event=interrupted signal="$sig" from="${OLD_VERSION:-?}" to="${VERSION:-?}" phase="$TXN_PHASE"
+    (( ! DRY_RUN )) || exit "$rc"
+    case "$TXN_PHASE" in
+        switched)
+            state_set incomplete "$OLD_VERSION"
+            state_set last-result "interrupted while switching between $OLD_VERSION and $VERSION; updates blocked until: relrotate rollback $APP"
+            notify "INTERRUPTED while switching to $VERSION" \
+                "relrotate was stopped while switching $APP between $OLD_VERSION and $VERSION, after files started to change. Updates are blocked. Run: relrotate rollback $APP (it reverts to $OLD_VERSION), or relrotate adopt $APP <version> if you fixed it by hand." ;;
+        pre) state_set last-result "interrupted before install of ${VERSION:-?}, nothing changed"
+            notify_once interrupted "INTERRUPTED before install of ${VERSION:-?}" \
+                "relrotate was stopped while updating $APP to ${VERSION:-?}, before anything changed; ${OLD_VERSION:-?} is still running. It will retry on the next timer run and does not alert again for the same interruption." ;;
+    esac
+    exit "$rc"
+}
+set_signal_traps() { trap 'on_signal TERM' TERM; trap 'on_signal INT' INT; }
+
 transaction_apply() {
     log info event=update-start from="$OLD_VERSION" to="$VERSION"
+    # Under the app lock (cmd_update): work dirs of a killed run are nobody's.
+    # A dry run changes nothing, so it leaves them for the next real run.
+    if (( ! DRY_RUN )); then
+        find "$STATE_DIR" -maxdepth 1 -name 'work.*' -exec rm -rf -- {} + || true
+        layout sweep
+    fi
     WORK="$(mktemp -d "$STATE_DIR/work.XXXXXX")"
     trap 'rm -rf "$WORK"' EXIT
+    TXN_PHASE=pre; set_signal_traps
 
     if layout needs_download; then
         download_and_verify || fail_update "download/verification failed"
@@ -82,69 +112,49 @@ transaction_apply() {
         return 0
     fi
 
-    layout stage || fail_update "staging failed"
-    if declare -F post_extract >/dev/null; then
-        post_extract || fail_update "post_extract hook failed"
-    fi
-    if declare -F pre_update >/dev/null; then
-        pre_update || fail_update "pre_update hook failed"
-    fi
+    local stage_rc=0
+    layout stage || stage_rc=$?
+    case "$stage_rc" in
+        0) ;;
+        3) outcome_already_live; exit 1 ;;
+        *) fail_update "staging failed" ;;
+    esac
+    run_hook post_extract
+    (( HOOK_RC == 0 )) || fail_update "post_extract hook failed"
+    run_hook pre_update
+    (( HOOK_RC == 0 )) || fail_update "pre_update hook failed"
 
     local flip_rc=0
+    TXN_PHASE=switched   # before the flip: a signal during it may leave files half-way
     layout flip || flip_rc=$?
     case "$flip_rc" in
         0) ;;
-        1) fail_update "flip failed" ;;
+        1) TXN_PHASE=pre; fail_update "flip failed" ;;
         *) revert_update "flip failed half-way"; return 1 ;;
     esac
     # --- past the flip: every failure reverts ---
-    if declare -F post_flip >/dev/null; then
-        post_flip || { revert_update "post_flip hook failed"; return 1; }
-    fi
+    run_hook post_flip
+    (( HOOK_RC == 0 )) || { revert_update "post_flip hook failed"; return 1; }
     restart_service || { revert_update "restart failed"; return 1; }
-    run_healthcheck || { revert_update "health check failed"; return 1; }
+    run_healthcheck
+    (( HEALTHY )) || { revert_update "health check failed"; return 1; }
 
-    state_set previous "$OLD_VERSION"
-    state_set installed "$VERSION"
-    state_set last-result "updated $OLD_VERSION -> $VERSION"
+    state_set_alert previous "$OLD_VERSION" "$VERSION" || return 1
+    state_set_alert installed "$VERSION" "$VERSION" || return 1
+    state_clear unhealthy failed-notified
+    commit_result "updated $OLD_VERSION -> $VERSION"
     layout prune
     log info event=updated from="$OLD_VERSION" to="$VERSION"
     notify "updated $OLD_VERSION -> $VERSION" \
-        "relrotate updated $APP on $(hostname -f 2>/dev/null || hostname) from $OLD_VERSION to $VERSION (policy=$POLICY, layout=$LAYOUT)."
+        "relrotate updated $APP on $(host_name) from $OLD_VERSION to $VERSION (policy=$POLICY, layout=$LAYOUT)." info
 }
 
 # Manual rollback from VERSION (installed) to OLD_VERSION (previous).
 # Once the files are on OLD_VERSION the state says so, even when the
 # restart or health check then fails. Mails only on failure.
 transaction_rollback() {
-    local cur="$VERSION" prev="$OLD_VERSION"
-    log info event=manual-rollback from="$cur" to="$prev"
-    if revert_to "$prev"; then
-        :
-    elif (( ! REVERT_SWITCHED )); then
-        log err event=manual-rollback-failed reason="$REVERT_PROBLEMS" live="$cur"
-        state_set last-result "manual rollback to $prev FAILED ($REVERT_PROBLEMS); $cur still live"
-        notify "manual rollback to $prev FAILED" \
-            "relrotate rollback $APP: $REVERT_PROBLEMS. Nothing was switched; $cur is still live. Check the stored versions under $STATE_DIR and the layout target."
-        echo "$APP: rollback to $prev failed ($REVERT_PROBLEMS); $cur is still live." >&2
-        return 1
-    fi
-
-    state_set installed "$prev"
-    state_set previous "$cur"
-    # Skip the version we rolled away from so the timer does not
-    # immediately reinstall it; a newer release clears this.
-    state_set skip "$cur"
-    if [[ -z "$REVERT_PROBLEMS" ]]; then
-        state_set last-result "manual rollback $cur -> $prev"
-        log info event=rolled-back to="$prev" skip="$cur"
-        echo "$APP rolled back to $prev; $cur will be skipped until a newer release appears."
-        return 0
-    fi
-    state_set last-result "manual rollback $cur -> $prev, UNHEALTHY: $REVERT_PROBLEMS"
-    log err event=rolled-back-unhealthy to="$prev" skip="$cur" problems="$REVERT_PROBLEMS"
-    notify "manual rollback to $prev: UNHEALTHY" \
-        "relrotate rollback $APP switched back to $prev, but: $REVERT_PROBLEMS. $prev is now live and recorded as installed; $cur is skipped until a newer release appears. Fix $prev, or go forward by hand (relrotate adopt after a manual install)."
-    echo "$APP: rolled back to $prev, but $REVERT_PROBLEMS." >&2
-    return 1
+    log info event=manual-rollback from="$VERSION" to="$OLD_VERSION"
+    TXN_PHASE=switched; set_signal_traps   # revert_to starts changing files at once
+    revert_to "$OLD_VERSION"
+    outcome_rollback
 }

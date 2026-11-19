@@ -1,0 +1,22 @@
+name: New recipe
+description: Ask for, or offer, a recipe for an app
+body:
+  - type: input
+    id: app
+    attributes:
+      label: App and release page
+      placeholder: https://github.com/owner/repo/releases
+    validations:
+      required: true
+  - type: dropdown
+    id: layout
+    attributes:
+      label: Layout
+      options: [symlink, binary, container]
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Asset names, how the release is verified (digest, checksums, signature), anything odd. If you have a working recipe, paste it with secrets removed.

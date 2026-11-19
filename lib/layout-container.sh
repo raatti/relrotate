@@ -4,6 +4,10 @@
 # are pulled before any quadlet changes and the set is rolled back together.
 # CONTAINERS=('quadlet-path|image-template' ...); QUADLET+IMAGE is the
 # one-entry form.
+# Before an update the digest of each image the quadlets name is recorded
+# next to the quadlet backup; a rollback points the tag back at that exact
+# image (a tag may have been re-pushed). PIN_DIGEST=yes writes the new
+# quadlets as Image=name:tag@sha256:..., so the backup itself is exact.
 
 layout_container_validate() {
     if (( ${#CONTAINERS[@]} == 0 )); then
@@ -16,14 +20,25 @@ layout_container_validate() {
     done
 }
 
+layout_container_doctor() {
+    local entry q
+    for entry in "${CONTAINERS[@]}"; do
+        q="${entry%%|*}"
+        if [[ -w "$q" ]]; then doctor_ok "quadlet $q writable"
+        else doctor_bad "quadlet $q missing or not writable"; fi
+    done
+}
+
 # The images are pulled in stage; there is no asset to download.
 layout_container_needs_download() { return 1; }
+
+layout_container_sweep() { :; }
 
 # The version is read from the first quadlet's Image= tag.
 layout_container_detect() {
     local q="${CONTAINERS[0]%%|*}" img tag
     [[ -r "$q" ]] || return 1
-    img="$(sed -n 's/^Image=[[:space:]]*//p' "$q" | head -n1)"
+    img="$(quadlet_image "$q")"
     tag="${img##*/}"; tag="${tag#*:}"; tag="${tag%%@*}"
     [[ -n "$tag" && "$tag" != "${img##*/}" ]] || return 1
     printf '%s' "${tag#"$TAG_PREFIX"}"
@@ -32,27 +47,156 @@ layout_container_detect() {
 podman_as_owner() {
     if [[ -n "$QUADLET_USER" ]]; then
         # cd somewhere the user can read; podman dislikes an unreadable cwd
-        (cd / && runuser -u "$QUADLET_USER" -- "$PODMAN" "$@")
+        (cd / && runuser -u "$QUADLET_USER" -- "$PODMAN" "$@" 9>&-)
     else
-        "$PODMAN" "$@"
+        "$PODMAN" "$@" 9>&-
     fi
 }
 
 # CONTAINERS=('quadlet-path|image-template' ...); QUADLET+IMAGE is the one-entry form.
-container_bak() { printf '%s/quadlet.%s.%s.bak' "$STATE_DIR" "$1" "$(basename "$2")"; }
+# The backup name carries a checksum of the full path: two quadlets with the
+# same basename in different dirs must not share a backup.
+container_bak() {
+    local sum; sum="$(printf '%s' "$2" | sha256sum)"; sum="${sum:0:12}"
+    printf '%s/quadlet.%s.%s.%s.bak' "$STATE_DIR" "$1" "$sum" "$(basename "$2")"
+}
+# 0.2.0 named backups without the checksum; read those as a fallback.
+container_bak_legacy() { printf '%s/quadlet.%s.%s.bak' "$STATE_DIR" "$1" "$(basename "$2")"; }
+# The 0.2.0 name is used only when no other quadlet in the set has the same
+# basename: such a set shared one legacy backup, so it fits only one of them.
+container_bak_find() {
+    local b entry n=0; b="$(container_bak "$1" "$2")"
+    if [[ ! -f "$b" ]]; then
+        for entry in "${CONTAINERS[@]}"; do
+            [[ "$(basename "${entry%%|*}")" == "$(basename "$2")" ]] && n=$((n+1))
+        done
+        (( n > 1 )) || b="$(container_bak_legacy "$1" "$2")"
+    fi
+    printf '%s' "$b"
+}
 
-layout_container_stage() {
-    local entry q image
-    # Pull everything first: a missing image aborts before any quadlet changes.
-    for entry in "${CONTAINERS[@]}"; do
-        q="${entry%%|*}"; image="$(expand "${entry#*|}")"
-        [[ -w "$q" ]] || { log err msg="quadlet not writable" quadlet="$q"; return 1; }
-        log info event=pull image="$image"
-        podman_as_owner pull --quiet "$image" >/dev/null || { log err msg="image pull failed" image="$image"; return 1; }
+# quadlet_scan FILE read|write [IMAGE]: the one parser of the Image key, as
+# systemd reads it: the last Image= inside [Container] (a single-value key
+# takes its last assignment), blanks allowed around the =; comments and other
+# sections do not count. read prints its value (trailing blanks and a CR
+# dropped: systemd ignores them). write prints FILE with that line replaced by
+# Image=IMAGE and returns 1 when there is none. Both return 3 for a line
+# continued with a trailing backslash, which is not supported. IMAGE goes
+# through the environment, so awk reads no escape in it.
+quadlet_scan() {
+    local files=("$1"); [[ "$2" != write ]] || files+=("$1")   # write: find the line, then print
+    MODE="$2" IMG="${3:-}" awk '
+        FNR == NR {
+            if ($0 ~ /^[[:space:]]*\[/) { s = $0; gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", s); in_c = (s == "Container") }
+            else if (in_c && match($0, /^[[:space:]]*Image[[:space:]]*=[[:space:]]*/)) {
+                last = FNR; val = substr($0, RLENGTH + 1); sub(/[[:space:]]+$/, "", val)
+                cont = (val ~ /\\$/)
+            }
+            next
+        }
+        FNR == last { print "Image=" ENVIRON["IMG"]; next }
+        { print }
+        END {
+            if (cont) exit 3
+            if (ENVIRON["MODE"] == "read") { if (last) print val }
+            else if (!last) exit 1
+        }
+    ' "${files[@]}"
+}
+# A continued line reads as no image (callers then say "unknown"); the reason is logged.
+quadlet_image() {
+    local rc=0
+    quadlet_scan "$1" read || rc=$?
+    (( rc != 3 )) || log err msg="a continued Image= line (trailing backslash) is not supported; put it on one line" quadlet="$1"
+    return 0
+}
+# image_repo REF: REF without its :tag (a registry :port stays).
+image_repo() {
+    local last="${1##*/}"
+    if [[ "$last" == *:* ]]; then printf '%s' "${1%:*}"; else printf '%s' "$1"; fi
+}
+image_digest() { podman_as_owner image inspect --format '{{.Digest}}' "$1" 2>/dev/null; }
+digest_file() { local b; b="$(container_bak "$1" "$2")"; printf '%s.digest' "${b%.bak}"; }
+
+# image_tag REF: the :tag of REF without a digest; nothing when it has none
+# (also for name@sha256:..., where the version on disk is unknowable).
+image_tag() {
+    local t="${1##*/}"
+    t="${t%%@*}"
+    [[ "$t" == *:* ]] || return 0
+    printf '%s' "${t#*:}"
+}
+
+# quadlet_on_old_version IMAGE TEMPLATE: does the quadlet's Image= still name
+# OLD_VERSION? A run killed after the flip leaves the quadlet on the new
+# version while installed says OLD_VERSION. True also when the template has
+# no version in it (:latest: the line is the same for every version).
+quadlet_on_old_version() {
+    local now new t old
+    now="$(image_tag "$1")"
+    [[ -n "$now" ]] || return 0
+    new="$(expand "$2")"
+    # shellcheck disable=SC2034  # read by expand() via dynamic scope
+    local VERSION TAG
+    # A manual rollback rebuilds the tag as TAG_PREFIX + version (see revert).
+    for t in "$(tag_for_version "$OLD_VERSION")" "$TAG_PREFIX$OLD_VERSION"; do
+        [[ -n "$t" ]] || continue
+        VERSION="$OLD_VERSION" TAG="$t"
+        old="$(expand "$2")"
+        [[ "$old" != "$new" ]] || return 0
+        [[ "$(image_tag "$old")" != "$now" ]] || return 0
     done
+    same_version "${now#"$TAG_PREFIX"}" "$OLD_VERSION"
+}
+
+# PINNED: the digest-pinned image per container. OLDDIG: the digest of the
+# image the quadlet named before the pull ("" when unknown). PULLED: the image
+# pulled so far, per container.
+PINNED=() OLDDIG=() PULLED=()
+layout_container_stage() {
+    local entry q image d old i
+    PINNED=() OLDDIG=() PULLED=()
+    # Before anything is pulled or backed up: a quadlet on another version
+    # than recorded would overwrite the OLD_VERSION backup with its own file.
     for entry in "${CONTAINERS[@]}"; do
         q="${entry%%|*}"
-        cp -p "$q" "$(container_bak "$OLD_VERSION" "$q")" || return 1
+        quadlet_on_old_version "$(quadlet_image "$q")" "${entry#*|}" && continue
+        local found bak; found="$(image_tag "$(quadlet_image "$q")")"; bak="$(container_bak_find "$OLD_VERSION" "$q")"
+        [[ -f "$bak" ]] || bak=""
+        # rollback would go to "previous", not to the recorded version: advise adopt, or a manual restore.
+        log err msg="quadlet Image= tag $found is not the recorded version $OLD_VERSION (an earlier run was probably killed after the flip); if $found runs fine: relrotate adopt $APP ${found#"$TAG_PREFIX"}; to go back to $OLD_VERSION restore $q ${bak:+from $bak }(or set its Image= to $OLD_VERSION) and restart the service" quadlet="$q"
+        return 1
+    done
+    # The image running now, by digest, unless the quadlet already pins it;
+    # read before any pull, which may move a tag that does not change (latest).
+    for i in "${!CONTAINERS[@]}"; do
+        q="${CONTAINERS[i]%%|*}"; old="$(quadlet_image "$q")"
+        OLDDIG[i]=""
+        if [[ -n "$old" && "$old" != *@* ]] && d="$(image_digest "$old")" && [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            OLDDIG[i]="$d"
+        else
+            log debug msg="no digest recorded for the current image" quadlet="$q" image="$old"
+        fi
+    done
+    # Pull everything first: a missing image aborts before any quadlet changes.
+    for i in "${!CONTAINERS[@]}"; do
+        entry="${CONTAINERS[i]}"
+        q="${entry%%|*}"; image="$(expand "${entry#*|}")"
+        [[ -w "$q" ]] || { log err msg="quadlet not writable" quadlet="$q"; unmove_tags; return 1; }
+        log info event=pull image="$image"
+        podman_as_owner pull --quiet "$image" >/dev/null || { log err msg="image pull failed" image="$image"; unmove_tags; return 1; }
+        PULLED[i]="$image"
+        if [[ "$PIN_DIGEST" == yes ]]; then
+            d="$(image_digest "$image")"
+            [[ "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || { log err msg="no digest for pulled image" image="$image"; unmove_tags; return 1; }
+            PINNED[i]="${image%@*}@$d"
+        fi
+    done
+    for i in "${!CONTAINERS[@]}"; do
+        q="${CONTAINERS[i]%%|*}"
+        cp -p "$q" "$(container_bak "$OLD_VERSION" "$q")" || { unmove_tags; return 1; }
+        rm -f -- "$(digest_file "$OLD_VERSION" "$q")"
+        [[ -z "${OLDDIG[i]}" ]] || printf '%s\n' "${OLDDIG[i]}" > "$(digest_file "$OLD_VERSION" "$q")" || { unmove_tags; return 1; }
     done
     # shellcheck disable=SC2034  # read by recipe hooks
     RELEASE_DIR=""
@@ -61,14 +205,20 @@ layout_container_stage() {
 
 layout_container_flip() { flip_containers; }
 
+# Returns 0 done, 1 nothing changed, 2 some quadlet was put back but the
+# revert is incomplete (same contract as flip).
 layout_container_revert() {
-    local to="$1" entry q bak rc=0
+    local to="$1" entry q bak rc=0 changed=0
     for entry in "${CONTAINERS[@]}"; do
-        q="${entry%%|*}"; bak="$(container_bak "$to" "$q")"
+        q="${entry%%|*}"; bak="$(container_bak_find "$to" "$q")"
         if [[ -f "$bak" ]]; then
-            cp -p "$bak" "$q" || rc=1
-            relabel "$q"
-            log info event=flipped quadlet="$q" restored="$bak"
+            if cp -p "$bak" "$q"; then
+                changed=1
+                relabel "$q"
+                log info event=flipped quadlet="$q" restored="$bak"
+            else
+                rc=1
+            fi
         else
             # No backup (e.g. manual rollback much later): rebuild the old tag.
             # A manual rollback has not fetched the release list, so fall
@@ -77,30 +227,78 @@ layout_container_revert() {
             local VERSION="$to" TAG
             # shellcheck disable=SC2034
             TAG="$(tag_for_version "$to")"; TAG="${TAG:-$TAG_PREFIX$to}"
-            rewrite_image "$q" "$(expand "${entry#*|}")" || rc=1
+            if rewrite_image "$q" "$(expand "${entry#*|}")"; then changed=1; else rc=1; fi
         fi
+        restore_image_tag "$to" "$q"
     done
     systemctl_for_app daemon-reload || rc=1
-    return "$rc"
+    (( rc == 0 )) && return 0
+    (( changed )) && return 2
+    return 1
+}
+
+# restore_image_tag VER QUADLET: point the quadlet's (unpinned) tag back at
+# the image recorded for VER, pulling it by digest if it is gone. A failure
+# is a warning: the quadlet then runs whatever the tag names now.
+restore_image_tag() {
+    local df img d; df="$(digest_file "$1" "$2")"
+    [[ -s "$df" ]] || return 0
+    img="$(quadlet_image "$2")"
+    [[ -n "$img" && "$img" != *@* ]] || return 0
+    retag_image "$img" "$(cat "$df")"
+}
+
+# retag_image IMAGE DIGEST [LEVEL]: LEVEL is how a failure is logged.
+retag_image() {
+    local img="$1" d="$2" level="${3:-warning}" repo; repo="$(image_repo "$1")"
+    if { podman_as_owner image exists "$repo@$d" || podman_as_owner pull --quiet "$repo@$d" >/dev/null; } \
+        && podman_as_owner tag "$repo@$d" "$img"; then
+        log info event=retagged image="$img" digest="$d"
+    else
+        log "$level" msg="could not point the tag back at the recorded image" image="$img" digest="$d"
+    fi
+}
+
+# unmove_tags: after a failed stage or flip, the quadlets are as they were, but
+# a pull may have moved a tag that is the same for every version (:latest) to
+# the new image. Point each such tag back at the digest recorded before the
+# pull. Version-named and pinned images are untouched by a pull: nothing to do.
+unmove_tags() {
+    local i q old
+    for i in "${!PULLED[@]}"; do
+        q="${CONTAINERS[i]%%|*}"; old="$(quadlet_image "$q")"
+        [[ -n "${OLDDIG[i]}" && "$old" == "${PULLED[i]}" ]] || continue
+        # err: the outcome says "nothing changed", but this tag now names the new image.
+        retag_image "$old" "${OLDDIG[i]}" err
+    done
 }
 
 # Only the OLD_VERSION quadlet backups are needed (rollback goes back one
 # version). Images are left for podman / the admin to prune.
 layout_container_prune() {
     local f
-    for f in "$STATE_DIR"/quadlet.*.bak; do
+    for f in "$STATE_DIR"/quadlet.*.bak "$STATE_DIR"/quadlet.*.digest; do
         [[ "$f" == "$STATE_DIR/quadlet.$OLD_VERSION."* ]] || rm -f -- "$f"
     done
 }
 
 # rewrite_image QUADLET IMAGE  (no daemon-reload); QUADLET is untouched on failure.
+# A symlinked quadlet is edited where it points: the link stays a link.
 rewrite_image() {
-    local q="$1" image="$2" tmp="$1.relrotate-new"
-    grep -q '^Image=' "$q" || { log err msg="no Image= line in quadlet" quadlet="$q"; return 1; }
-    { sed "s|^Image=.*|Image=$image|" "$q" > "$tmp" \
-        && { chown --reference="$q" "$tmp" 2>/dev/null || true; } \
+    local q image="$2" tmp rc=0
+    q="$(readlink -f -- "$1")" || q="$1"
+    tmp="$q.relrotate-new"
+    { : > "$tmp"; } 2>/dev/null || { log err msg="could not write the quadlet" quadlet="$q"; return 1; }
+    quadlet_scan "$q" write "$image" > "$tmp" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) rm -f "$tmp"; log err msg="no Image= line in the [Container] section of the quadlet" quadlet="$q"; return 1 ;;
+        3) rm -f "$tmp"; log err msg="a continued Image= line (trailing backslash) is not supported; put it on one line" quadlet="$q"; return 1 ;;
+        *) rm -f "$tmp"; log err msg="could not read the quadlet" quadlet="$q"; return 1 ;;
+    esac
+    { { chown --reference="$q" "$tmp" 2>/dev/null || true; } \
         && chmod --reference="$q" "$tmp" \
-        && mv -f "$tmp" "$q"; } || { rm -f "$tmp"; return 1; }
+        && mv -f "$tmp" "$q"; } || { rm -f "$tmp"; log err msg="could not write the quadlet" quadlet="$q"; return 1; }
     relabel "$q"
     log info event=flipped quadlet="$q" image="$image"
 }
@@ -108,15 +306,24 @@ rewrite_image() {
 # Returns 1 if nothing changed, 2 if quadlets changed and could not be put
 # back (caller must roll back).
 flip_containers() {
-    local entry
-    for entry in "${CONTAINERS[@]}"; do
-        if ! rewrite_image "${entry%%|*}" "$(expand "${entry#*|}")"; then
-            restore_quadlets; return
+    local entry i
+    for i in "${!CONTAINERS[@]}"; do
+        entry="${CONTAINERS[i]}"
+        if ! rewrite_image "${entry%%|*}" "${PINNED[i]:-$(expand "${entry#*|}")}"; then
+            undo_flip; return
         fi
     done
     systemctl_for_app daemon-reload && return 0
     log err msg="daemon-reload failed, restoring previous quadlets"
-    restore_quadlets
+    undo_flip
+}
+
+# restore_quadlets, then, when that worked (nothing changed), the moved tags.
+undo_flip() {
+    local rc=0
+    restore_quadlets || rc=$?
+    (( rc != 1 )) || unmove_tags
+    return "$rc"
 }
 
 # Put every quadlet back from the OLD_VERSION backup made in stage.
@@ -125,7 +332,7 @@ restore_quadlets() {
     local entry q
     for entry in "${CONTAINERS[@]}"; do
         q="${entry%%|*}"
-        if ! cp -p "$(container_bak "$OLD_VERSION" "$q")" "$q"; then
+        if ! cp -p "$(container_bak_find "$OLD_VERSION" "$q")" "$q"; then
             log err msg="could not restore quadlet" quadlet="$q"; return 2
         fi
         relabel "$q"

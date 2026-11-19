@@ -1,0 +1,12 @@
+[Unit]
+Description=relrotate notification summary timer
+Documentation=https://github.com/raatti/relrotate
+
+[Timer]
+# Sends what NOTIFY_POLICY=failures|digest queued; nothing when the queue is
+# empty. Another time or several: systemctl edit relrotate-digest.timer
+OnCalendar=*-*-* 08:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

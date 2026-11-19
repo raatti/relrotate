@@ -1,0 +1,48 @@
+# On a v* tag push (GitHub only: Forgejo reads .forgejo/workflows), build
+# relrotate-X.Y.Z.tar.gz from the tag plus SHA256SUMS and open a draft
+# release with that version's CHANGELOG section. Publishing is manual.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build tarball, checksums and notes
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          v="${TAG#v}"
+          # The tag must match the version the script reports.
+          grep -qx "RELROTATE_VERSION=\"$v\"" relrotate \
+            || { echo "::error::tag $TAG does not match RELROTATE_VERSION"; exit 1; }
+          mkdir dist
+          git archive --format=tar.gz --prefix="relrotate-$v/" \
+            -o "dist/relrotate-$v.tar.gz" HEAD
+          (cd dist && sha256sum "relrotate-$v.tar.gz" > SHA256SUMS)
+          awk -v h="## $v" 'index($0, h) == 1 {on = 1; next} on && /^## / {exit} on' \
+            CHANGELOG.md > notes.md
+          [[ -s notes.md ]] || { echo "::error::no CHANGELOG section for $v"; exit 1; }
+          echo "v=$v" >> "$GITHUB_ENV"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --draft --verify-tag \
+            --title "relrotate $v" --notes-file notes.md \
+            "dist/relrotate-$v.tar.gz" dist/SHA256SUMS

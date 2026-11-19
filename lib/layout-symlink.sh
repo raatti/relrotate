@@ -5,11 +5,17 @@
 layout_symlink_validate() {
     [[ -n "$ASSET" ]] || die 2 "$APP: ASSET is not set"
     [[ -n "$TARGET" ]] || die 2 "$APP: TARGET is not set"
-    [[ -n "$VERIFY" ]] || die 2 "$APP: VERIFY is not set (use VERIFY=none to opt out explicitly)"
+    verify_validate
     [[ -n "$RELEASES_DIR" ]] || RELEASES_DIR="${TARGET}-releases"
 }
 
 layout_symlink_needs_download() { return 0; }
+
+# Half-extracted releases of a run that was killed.
+layout_symlink_sweep() {
+    [[ -d "$RELEASES_DIR" ]] || return 0
+    find "$RELEASES_DIR/" -maxdepth 1 -name '*.relrotate-new' -exec rm -rf -- {} + || true
+}
 
 layout_symlink_detect() {
     [[ -L "$TARGET" ]] || return 1
@@ -23,18 +29,13 @@ layout_symlink_stage() {
     fi
     mkdir -p "$RELEASES_DIR"
     RELEASE_DIR="$RELEASES_DIR/$VERSION"
-    # After a failed rollback the new release stays live while state still
-    # names the old one; restaging it would rm -rf the tree being served.
+    # State behind the live release (a failed rollback on 0.2.0, a crash, a
+    # hand fix): restaging it would rm -rf the tree being served.
     if [[ "$(readlink -f "$TARGET")" == "$(readlink -f "$RELEASE_DIR")" ]]; then
-        log err event=state-behind live="$VERSION" recorded="$OLD_VERSION"
-        state_set last-result "refused: $VERSION already live, state says $OLD_VERSION"
-        notify "$VERSION is already live, state says $OLD_VERSION" \
-            "relrotate update $APP: $TARGET already points at $RELEASE_DIR, but the recorded version is $OLD_VERSION (an earlier rollback probably failed). Nothing was changed. Check that $VERSION works, then run: relrotate adopt $APP $VERSION"
-        exit 1
+        return 3   # already live: the transaction records it (see layout.sh)
     fi
     local tmp="$RELEASE_DIR.relrotate-new"
     rm -rf -- "$tmp"
-    archive_is_sane "$DOWNLOAD" || return 1
     extract_to "$DOWNLOAD" "$tmp" "${STRIP_COMPONENTS:-1}" || return 1
 
     local pair rel src
@@ -58,6 +59,8 @@ layout_symlink_stage() {
     relabel "$RELEASE_DIR"
     log info event=staged dir="$RELEASE_DIR"
 }
+
+layout_symlink_doctor() { doctor_target_dir; }
 
 layout_symlink_flip() { flip_symlink "$RELEASES_DIR/$VERSION"; }
 
