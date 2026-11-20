@@ -41,15 +41,44 @@ layout_container_detect() {
     img="$(quadlet_image "$q")"
     tag="${img##*/}"; tag="${tag#*:}"; tag="${tag%%@*}"
     [[ -n "$tag" && "$tag" != "${img##*/}" ]] || return 1
-    printf '%s' "${tag#"$TAG_PREFIX"}"
+    local v; v="$(tag_version "$tag")"   # the recipe's tag scheme, as for releases
+    [[ -n "$v" ]] || return 1
+    printf '%s' "$v"
 }
 
+# as_owner CMD...: run CMD as the quadlet's owner. cd somewhere the user can
+# read; podman dislikes an unreadable cwd.
+as_owner() { (cd / && runuser -u "$QUADLET_USER" -- "$@" 9>&-); }
+
 podman_as_owner() {
-    if [[ -n "$QUADLET_USER" ]]; then
-        # cd somewhere the user can read; podman dislikes an unreadable cwd
-        (cd / && runuser -u "$QUADLET_USER" -- "$PODMAN" "$@" 9>&-)
+    if [[ -n "$QUADLET_USER" ]]; then as_owner "$PODMAN" "$@"; else "$PODMAN" "$@" 9>&-; fi
+}
+
+# A rootless quadlet sits in a directory its owner can write to. Root must
+# not open, create or rename anything there: the owner could have pointed
+# the name at any file on the system (a symlink). So with QUADLET_USER every
+# read and write of the quadlet is done by that account, and root only
+# works on copies in its own state directory.
+
+# quadlet_src Q: the file to read Q from: Q itself, or for a rootless
+# quadlet a fresh copy its owner's account made.
+quadlet_src() {
+    [[ -n "${QUADLET_USER:-}" ]] || { printf '%s' "$1"; return 0; }
+    local c; c="$(printf '%s' "$1" | sha256sum)"; c="$STATE_DIR/quadlet.read.${c:0:12}"
+    if as_owner cat -- "$1" > "$c.part" 2>/dev/null && mv -f "$c.part" "$c"; then printf '%s' "$c"
+    else rm -f "$c.part"; return 1; fi
+}
+
+# quadlet_put Q SRC: make SRC the content of Q. Rootless: the owner's
+# account writes it, through a temporary file that starts as a copy of Q, so
+# the mode stays. Rootful: a plain copy, as before.
+quadlet_put() {
+    if [[ -n "${QUADLET_USER:-}" ]]; then
+        # shellcheck disable=SC2016  # $1 belongs to the inner shell
+        as_owner bash -c 'cp -p -- "$1" "$1.relrotate-new" && cat > "$1.relrotate-new" && mv -f -- "$1.relrotate-new" "$1"' \
+            bash "$1" < "$2"
     else
-        "$PODMAN" "$@" 9>&-
+        cp -p "$2" "$1" && relabel "$1"
     fi
 }
 
@@ -105,8 +134,9 @@ quadlet_scan() {
 }
 # A continued line reads as no image (callers then say "unknown"); the reason is logged.
 quadlet_image() {
-    local rc=0
-    quadlet_scan "$1" read || rc=$?
+    local rc=0 src
+    src="$(quadlet_src "$1")" || return 0
+    quadlet_scan "$src" read || rc=$?
     (( rc != 3 )) || log err msg="a continued Image= line (trailing backslash) is not supported; put it on one line" quadlet="$1"
     return 0
 }
@@ -194,7 +224,7 @@ layout_container_stage() {
     done
     for i in "${!CONTAINERS[@]}"; do
         q="${CONTAINERS[i]%%|*}"
-        cp -p "$q" "$(container_bak "$OLD_VERSION" "$q")" || { unmove_tags; return 1; }
+        cp -p "$(quadlet_src "$q")" "$(container_bak "$OLD_VERSION" "$q")" || { unmove_tags; return 1; }
         rm -f -- "$(digest_file "$OLD_VERSION" "$q")"
         [[ -z "${OLDDIG[i]}" ]] || printf '%s\n' "${OLDDIG[i]}" > "$(digest_file "$OLD_VERSION" "$q")" || { unmove_tags; return 1; }
     done
@@ -212,9 +242,8 @@ layout_container_revert() {
     for entry in "${CONTAINERS[@]}"; do
         q="${entry%%|*}"; bak="$(container_bak_find "$to" "$q")"
         if [[ -f "$bak" ]]; then
-            if cp -p "$bak" "$q"; then
+            if quadlet_put "$q" "$bak"; then
                 changed=1
-                relabel "$q"
                 log info event=flipped quadlet="$q" restored="$bak"
             else
                 rc=1
@@ -285,21 +314,35 @@ layout_container_prune() {
 # rewrite_image QUADLET IMAGE  (no daemon-reload); QUADLET is untouched on failure.
 # A symlinked quadlet is edited where it points: the link stays a link.
 rewrite_image() {
-    local q image="$2" tmp rc=0
-    q="$(readlink -f -- "$1")" || q="$1"
-    tmp="$q.relrotate-new"
+    local q image="$2" src tmp rc=0
+    if [[ -n "${QUADLET_USER:-}" ]]; then
+        # Rootless: read the owner's copy, build the new text in the state
+        # directory, let the owner's account put it in place.
+        q="$1"
+        src="$(quadlet_src "$q")" || { log err msg="could not read the quadlet" quadlet="$q"; return 1; }
+        tmp="$src.new"
+    else
+        q="$(readlink -f -- "$1")" || q="$1"
+        src="$q"; tmp="$q.relrotate-new"
+    fi
     { : > "$tmp"; } 2>/dev/null || { log err msg="could not write the quadlet" quadlet="$q"; return 1; }
-    quadlet_scan "$q" write "$image" > "$tmp" || rc=$?
+    quadlet_scan "$src" write "$image" > "$tmp" || rc=$?
     case "$rc" in
         0) ;;
         1) rm -f "$tmp"; log err msg="no Image= line in the [Container] section of the quadlet" quadlet="$q"; return 1 ;;
         3) rm -f "$tmp"; log err msg="a continued Image= line (trailing backslash) is not supported; put it on one line" quadlet="$q"; return 1 ;;
         *) rm -f "$tmp"; log err msg="could not read the quadlet" quadlet="$q"; return 1 ;;
     esac
-    { { chown --reference="$q" "$tmp" 2>/dev/null || true; } \
-        && chmod --reference="$q" "$tmp" \
-        && mv -f "$tmp" "$q"; } || { rm -f "$tmp"; log err msg="could not write the quadlet" quadlet="$q"; return 1; }
-    relabel "$q"
+    if [[ -n "${QUADLET_USER:-}" ]]; then
+        quadlet_put "$q" "$tmp" || rc=1
+        rm -f "$tmp"
+        (( rc == 0 )) || { log err msg="could not write the quadlet" quadlet="$q"; return 1; }
+    else
+        { { chown --reference="$q" "$tmp" 2>/dev/null || true; } \
+            && chmod --reference="$q" "$tmp" \
+            && mv -f "$tmp" "$q"; } || { rm -f "$tmp"; log err msg="could not write the quadlet" quadlet="$q"; return 1; }
+        relabel "$q"
+    fi
     log info event=flipped quadlet="$q" image="$image"
 }
 
@@ -332,10 +375,9 @@ restore_quadlets() {
     local entry q
     for entry in "${CONTAINERS[@]}"; do
         q="${entry%%|*}"
-        if ! cp -p "$(container_bak_find "$OLD_VERSION" "$q")" "$q"; then
+        if ! quadlet_put "$q" "$(container_bak_find "$OLD_VERSION" "$q")"; then
             log err msg="could not restore quadlet" quadlet="$q"; return 2
         fi
-        relabel "$q"
     done
     if ! systemctl_for_app daemon-reload; then
         log err msg="daemon-reload failed after restoring quadlets"; return 2

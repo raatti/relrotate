@@ -64,11 +64,19 @@ cat <<EOF
 relrotate installed.
 
 Next:
-  cp $PREFIX/share/relrotate/examples/apps.d/<app>.conf $ETC/apps.d/   # then edit
+  relrotate adopt <app>                          # an app that is already installed: writes its recipe
+  cp $PREFIX/share/relrotate/examples/apps.d/<app>.conf $ETC/apps.d/   # or by hand, then edit
   relrotate check <app>
   relrotate adopt <app> <installed-version>      # only if check shows 'unknown'
   relrotate update --dry-run <app>
-  systemctl enable --now relrotate@<app>.timer
+  relrotate enable <app>                         # turns on relrotate@<app>.timer
+  relrotate setup                                # mail and chat notifications, if not set below
   relrotate doctor                               # checks every recipe, changes nothing
   systemctl enable --now relrotate-digest.timer  # only with NOTIFY_POLICY=failures|digest
 EOF
+
+# On a terminal: ask where notifications go (setup only asks when none are set).
+if [[ -t 0 && -t 1 ]]; then
+    echo
+    "$PREFIX/sbin/relrotate" setup || echo "notifications not set up; run later: relrotate setup" >&2
+fi

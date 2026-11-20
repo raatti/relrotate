@@ -74,6 +74,23 @@ fetch_fail() {
     exit 1
 }
 
+# jq: the version a tag stands for. Without VERSION_REGEX, TAG_PREFIX is cut
+# off. A regex with a group v gives the version as is; with groups v1..v4
+# (a date tag: 2026-11-18-r1) the numbers are joined with dots (2026.11.18.1).
+# shellcheck disable=SC2016  # jq variables, not shell
+JQ_TAG_VERSION='def tag_version($re; $prefix):
+    if $re == "" then ltrimstr($prefix)
+    else (capture($re)? // empty)
+         | if .v != null then .v
+           else [.v1, .v2, .v3, .v4] | map(select(. != null) | tonumber? | tostring) | join(".") end
+    end;'
+
+# tag_version TAG: the same for one tag (an image tag in a quadlet).
+tag_version() {
+    jq -rn --arg t "$1" --arg re "$VERSION_REGEX" --arg prefix "$TAG_PREFIX" \
+        "$JQ_TAG_VERSION"' $t | tag_version($re; $prefix)'
+}
+
 fetch_releases() {
     local raw kind="${SOURCE%%:*}" spec="${SOURCE#*:}"
     case "$kind" in
@@ -93,25 +110,25 @@ fetch_releases() {
             ;;
         *) die 2 "$APP: unknown SOURCE type '$kind' (github|gitea)" ;;
     esac
-    [[ -n "${raw//[[:space:]]/}" ]] || fetch_fail "release API returned an empty response for $spec"
+    # A regex, not ${raw//[[:space:]]/}: that takes minutes on a 2 MB list.
+    [[ "$raw" =~ [^[:space:]] ]] || fetch_fail "release API returned an empty response for $spec"
 
     # n: releases that pass draft/prerelease filtering; r: those with a usable version.
     # A tag_name that is not a string (null) is skipped; \z, not $, so a
     # trailing newline cannot pass.
     local parsed n
     parsed="$(jq -c --arg prefix "$TAG_PREFIX" --arg re "$VERSION_REGEX" \
-        --arg pre "$ALLOW_PRERELEASE" '
+        --arg pre "$ALLOW_PRERELEASE" "$JQ_TAG_VERSION"'
         [ .[]
           | select(.draft != true)
           | select($pre == "yes" or .prerelease != true)
           | select(.tag_name | type == "string") ] as $elig
         | { t: length, n: ($elig | length), r: [ $elig[]
           | (.tag_name) as $tag
-          | ( if $re != "" then ($tag | capture($re).v? // empty)
-              else ($tag | ltrimstr($prefix)) end ) as $v
-          | select($v | test(
-              if $pre == "yes" then "^[0-9]+\\.[0-9]+(\\.[0-9]+)?(-[0-9A-Za-z.]+)?\\z"
-              else "^[0-9]+\\.[0-9]+(\\.[0-9]+)?\\z" end))
+          | ($tag | tag_version($re; $prefix)) as $v
+          | select($v | test("^[0-9]+\\.[0-9]+(\\.[0-9]+)"
+              + (if $re != "" then "{0,2}" else "?" end)   # a regex may give four parts
+              + (if $pre == "yes" then "(-[0-9A-Za-z.]+)?" else "" end) + "\\z"))
           | select($v | sub("-.*"; "") | test("[0-9]{10}") | not)
           | { tag: $tag, version: $v, prerelease: (.prerelease // false),
               published: (.published_at // .created_at // null),

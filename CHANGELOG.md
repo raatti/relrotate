@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.0 (2026-11-20)
+
+- `VERSION_REGEX` with groups `v1`..`v4` reads date-style tags
+  (`2026-11-18-r1` is version `2026.11.18.1`); the container layout reads the
+  installed version from the quadlet with the same rule. New example recipe:
+  npmplus (#92).
+- `relrotate adopt <app>` without a version takes over an existing install:
+  it writes the recipe (shipped example or `--source`) from the quadlet or
+  unit found on the host, records the installed version, lists old updaters
+  and runs the `doctor` checks (#88).
+- The backup hooks in the headscale, lldap, vaultwarden and immich examples
+  are commented out: backups are opt-in (#88).
+- Security: with `QUADLET_USER` set, the quadlet is read and written by that
+  account, never by root. Before, root created and renamed files in the
+  owner's directory, where a planted symlink could redirect them (#105).
+- `relrotate enable <app>` / `disable <app>` turn the app's timer on and off,
+  so the unit name `relrotate@<app>.timer` need not be typed (#87).
+- The release check no longer hangs for minutes on a large release list
+  (headscale's is 2.5 MB); `doctor` says when it asks the release API (#90).
+- `doctor` says whether a recipe takes a backup before updates and how to
+  turn that off; the README says backups are optional (#93).
+- `install.sh` and `relrotate enable` remind that mail and chat notifications
+  are off until `MAIL_TO` or `NOTIFY` is set (#95).
+- `relrotate setup` asks for a mail address and a chat destination (discord,
+  ntfy, webhook) and writes them; `install.sh` runs it on a terminal when
+  no notifications are set (#97).
+
 ## 0.3.0 (2026-11-17)
 
 Upgrade notes (behaviour that changes for existing setups):

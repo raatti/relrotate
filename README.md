@@ -98,10 +98,10 @@ RHEL 9/10 and clones; Debian and Ubuntu with the same paths
 
 ```bash
 sudo cp /usr/local/share/relrotate/examples/apps.d/headscale.conf /etc/relrotate/apps.d/
-sudoedit /etc/relrotate/apps.d/headscale.conf
+sudoedit /etc/relrotate/apps.d/headscale.conf   # paths; uncomment the backup hook if you want it
 sudo relrotate check headscale
 sudo relrotate update --dry-run headscale     # download + verify only
-sudo systemctl enable --now relrotate@headscale.timer
+sudo relrotate enable headscale               # relrotate@headscale.timer
 ```
 
 If `check` reports the installed version as `unknown`, either add a
@@ -110,6 +110,47 @@ If `check` reports the installed version as `unknown`, either add a
 ```bash
 sudo relrotate adopt headscale 0.29.7
 ```
+
+## Taking over an existing install
+
+`relrotate adopt <app>` looks at the host and gets an app that is already
+running under relrotate's care, without touching the app:
+
+```bash
+sudo relrotate adopt headscale                              # a shipped example exists
+sudo relrotate adopt --source github:owner/repo myapp       # no example: say where releases are
+```
+
+- **Recipe.** If `/etc/relrotate/apps.d/<app>.conf` is missing it is written,
+  from the shipped example when there is one, else from `--source`. An
+  existing recipe is never changed.
+- **What is read from the host.** A quadlet `<app>.container` in
+  `/etc/containers/systemd`: container layout, `QUADLET` and `IMAGE` with
+  the tag as `${TAG}` or `${VERSION}`. Else the unit `<app>.service`: its
+  `ExecStart` program is the `TARGET` of a binary layout, or, when it sits
+  under a link to a directory named like a version (`current -> 1.2.3`),
+  that link is the `TARGET` of a symlink layout. Else a quadlet in root's or
+  a user's `~/.config/containers/systemd` (with `QUADLET_USER`).
+- **What is not taken.** A unit that starts a program under `/usr/bin`,
+  `/usr/sbin` or `/usr/lib` (a wrapper such as `podman`, `java` or `env`,
+  or a packaged binary); a quadlet that is a symlink or does not belong to
+  the owner of its directory; a value with characters outside
+  `A-Z a-z 0-9 . _ / : @ + -`. An image tag that is not a plain version
+  (`latest`, `1.2.3-alpine`) is reported for you to check.
+- **Download file.** Without an example, `ASSET` is written only when exactly
+  one file of the newest release fits this host, and `VERIFY` only when the
+  release API gives a digest. Otherwise the candidates are listed in the
+  recipe and `adopt` stops until you have filled them in.
+- **Version.** The installed version is read and recorded. When it cannot be
+  read (a binary without `current_version`, a quadlet on `:latest`, a web
+  root that is still a plain directory) `adopt` says what to do and exits 2.
+- **Old updaters.** Timers, update services and cron files that mention the
+  app, and `AutoUpdate=` in the quadlet, are listed with the command to turn
+  them off. `adopt` does not turn them off.
+- **Backups** stay off; a hook from the example is there, commented out.
+
+It ends with the `doctor` checks for the app. Then run
+`relrotate update --dry-run <app>` and `relrotate enable <app>`.
 
 ## Commands
 
@@ -123,9 +164,17 @@ relrotate rollback <app>       back to the previous version; skips the
                                retries a rollback left incomplete
 relrotate adopt <app> <ver>    record the installed version (clears an
                                incomplete-rollback block)
+relrotate adopt <app>          take over an install that is already there:
+                               see "Taking over an existing install"
 relrotate hold <app> [reason]  no updates until unhold (rollback and adopt
                                still work); status shows HELD(reason)
 relrotate unhold <app>
+relrotate enable <app>         turn on the app's timer: systemctl enable --now
+                               relrotate@<app>.timer
+relrotate disable <app>        turn the timer off
+relrotate setup                ask where notifications go (mail, discord,
+                               ntfy, webhook) when none are set; install.sh
+                               runs it on a terminal
 relrotate status [app]         one line per app; --json for scripts
 relrotate doctor [app]         check recipes, the newest release's assets,
                                paths, keyrings and notifications; also the
@@ -142,7 +191,7 @@ is the time of the last good one), `SKIP(v)` and `WAITING(v until date)`.
 `status --json` prints one array with the same fields (`null` when unset).
 
 Unknown options and extra arguments are an error (exit 2, with the usage);
-`-n` is refused for `adopt`, `rollback`, `hold`, `unhold` and `digest`. `relrotate` with no command
+`-n` is refused for `adopt`, `rollback`, `hold`, `unhold`, `enable`, `disable`, `setup` and `digest`. `relrotate` with no command
 prints the usage and exits 2. App names start with a letter or digit.
 
 ## Recipe reference
@@ -155,7 +204,7 @@ single quotes so relrotate expands them, not the shell.
 |---|---|---|
 | `SOURCE` | | `github:owner/repo` or `gitea:https://host/owner/repo` |
 | `TAG_PREFIX` | `v` | stripped from tags to get the version |
-| `VERSION_REGEX` | | jq regex with a named group `v`, for odd tag schemes |
+| `VERSION_REGEX` | | jq regex for odd tag schemes: a named group `v` is the version; groups `v1`..`v4` are joined with dots, so a date tag `2026-11-18-r1` becomes `2026.11.18.1` (see the npmplus example; use `POLICY=major`) |
 | `ALLOW_PRERELEASE` | `no` | `yes` accepts `X.Y.Z-rc1` style tags |
 | `ASSET` | | asset name template, or `@tarball` for the source archive |
 | `VERIFY` | | space-separated methods, see above |
@@ -207,6 +256,11 @@ step that may fail ends in `|| true`. Commands in a condition (`if`, `&&`,
 hook cannot set variables for relrotate or for a later hook.
 Hooks run with the run lock closed (fd 9), so a daemon they start does not
 keep `relrotate` locked.
+
+Backups are optional and off by default: relrotate takes one only when a
+recipe's hook calls a helper. Some shipped examples (headscale, lldap,
+vaultwarden, immich) carry such a hook commented out; uncomment it to turn
+the backup on. `relrotate doctor <app>` says which it is.
 
 Two helpers back up a database from a hook, usually `pre_update`, so the
 update stops before anything changes when the backup fails:
@@ -282,6 +336,7 @@ In `examples/apps.d/`, each checked against the project's real releases:
 | adminer | symlink | single PHP file renamed to index.php |
 | tuwunel | container | rootless quadlet (`QUADLET_USER`) |
 | vaultwarden | container | tag without `v`, SQLite backup |
+| npmplus | container | date tags (`2026-11-18-r1`) through `VERSION_REGEX` |
 | paperless-ngx | container | `v` tag, plain image tag |
 | jellyfin | container | two-part versions |
 | home-assistant | container | date versions |
@@ -293,6 +348,10 @@ In `examples/apps.d/`, each checked against the project's real releases:
 Paths, ports and hostnames in them are examples; adjust to your host.
 
 ## Notifications
+
+`relrotate setup` asks for a mail address and one chat destination and
+writes them for you, as long as none are set; `install.sh` runs it when it
+is on a terminal. By hand:
 
 Each event goes to `MAIL_TO` and to every `NOTIFY` destination in
 `/etc/relrotate/relrotate.conf`, as `kind:file`:

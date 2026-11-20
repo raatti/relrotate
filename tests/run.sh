@@ -64,9 +64,11 @@ mkdir -p "$T/log"
 cat > "$T/bin/systemctl" <<EOF
 #!/usr/bin/env bash
 echo "systemctl \$*" >> "$T/log/systemctl"
+if [[ "\${1:-}" == cat ]]; then cat "$T/units/\$2" 2>/dev/null; exit; fi   # systemctl cat UNIT
 if [[ " \$* " == *" is-active "* ]]; then [[ ! -e "$T/unhealthy" ]]; exit; fi
 # fail-restart: empty fails every restart, a unit name fails only that unit
 if [[ " \$* " == *" restart "* ]]; then [[ ! -e "$T/fail-restart" ]] || [[ -s "$T/fail-restart" && " \$* " != *" \$(cat "$T/fail-restart") "* ]]; exit; fi
+if [[ " \$* " == *"able --now "* ]]; then [[ ! -e "$T/fail-enable" ]]; exit; fi
 if [[ " \$* " == *" daemon-reload "* ]]; then
     if [[ -e "$T/fail-reload-once" ]]; then rm -f "$T/fail-reload-once"; exit 1; fi
     [[ ! -e "$T/fail-reload" ]]; exit
@@ -94,6 +96,13 @@ if [[ " \$* " == *" exec "* ]]; then   # pg_dumpall in a container
 fi
 if [[ " \$* " == *" pull "*"@sha256:"* ]]; then [[ ! -e "$T/image-gone" ]]; exit; fi
 exit 0
+EOF
+# runuser -u USER -- CMD...: logged, then CMD runs (as the test user).
+cat > "$T/bin/runuser" <<EOF
+#!/usr/bin/env bash
+echo "runuser \$*" >> "$T/log/runuser"
+[[ "\$1" == -u && "\$3" == -- ]] || exit 64
+shift 3; exec "\$@"
 EOF
 # Release API requests are answered from $STUB_RELEASES; file:// URLs go
 # to the real curl by absolute path, with -q (~/.curlrc ignored) and
@@ -1026,9 +1035,9 @@ echo "== install layout: PREFIX/sbin and PREFIX/lib/relrotate"
 rm -rf "$T/pfx"; mkdir -p "$T/pfx/sbin" "$T/pfx/lib/relrotate"
 cp "$RR" "$T/pfx/sbin/relrotate"; cp "$here"/../lib/*.sh "$T/pfx/lib/relrotate/"
 check "relrotate finds PREFIX/lib/relrotate next to PREFIX/sbin (RELROTATE_LIB_DIR unset)" \
-    bash -c "unset RELROTATE_LIB_DIR; '$T/pfx/sbin/relrotate' --version | grep -q 0.3"
+    bash -c "unset RELROTATE_LIB_DIR; '$T/pfx/sbin/relrotate' --version | grep -q '^relrotate [0-9]'"
 ln -s "$T/pfx/sbin/relrotate" "$T/pfx-link"
-check "  also through a symlink" bash -c "unset RELROTATE_LIB_DIR; '$T/pfx-link' --version | grep -q 0.3"
+check "  also through a symlink" bash -c "unset RELROTATE_LIB_DIR; '$T/pfx-link' --version | grep -q '^relrotate [0-9]'"
 check "  RELROTATE_LIB_DIR still wins" bash -c "RELROTATE_LIB_DIR='$T/nowhere' '$T/pfx/sbin/relrotate' --version 2>/dev/null; test \$? != 0"
 rm -rf "$T/pfx" "$T/pfx-link"
 
@@ -1565,6 +1574,63 @@ check "unhold" "$RR" unhold web
 check "  updates run again" bash -c "'$RR' update web 2>/dev/null && test \"\$(readlink '$T/www/demo')\" = '$T/www/demo-releases/1.3.0'"
 check "unhold when not held says so" bash -c "'$RR' unhold web | grep -q 'not held'"
 check "hold an unknown app fails" test "$(rc_of "$RR" hold nosuch)" = 2
+
+echo "== enable / disable"
+reset_logs
+check "enable turns the app's timer on" bash -c "'$RR' enable web >/dev/null && grep -qx 'systemctl enable --now relrotate@web.timer' '$T/log/systemctl'"
+check "disable turns it off" bash -c "'$RR' disable web >/dev/null && grep -qx 'systemctl disable --now relrotate@web.timer' '$T/log/systemctl'"
+touch "$T/fail-enable"
+check "a failing systemctl exits 1" test "$(rc_of "$RR" enable web)" = 1
+rm -f "$T/fail-enable"
+reset_logs
+check "enable an unknown app exits 2" test "$(rc_of "$RR" enable nosuch)" = 2
+check "  and systemctl is not called" test ! -e "$T/log/systemctl"
+check "enable has no --dry-run" test "$(rc_of "$RR" enable web -n)" = 2
+check "enable without an app exits 2" test "$(rc_of "$RR" enable)" = 2
+check "enable says nothing about notifications when MAIL_TO is set" bash -c "! '$RR' enable web | grep -q 'journal only'"
+cp "$T/etc/relrotate.conf" "$T/etc/relrotate.conf.bak"; : > "$T/etc/relrotate.conf"
+check "enable without MAIL_TO or NOTIFY points at relrotate.conf" bash -c "'$RR' enable web | grep -q 'journal only.*MAIL_TO or NOTIFY in $T/etc/relrotate.conf'"
+check "  disable does not" bash -c "! '$RR' disable web | grep -q 'journal only'"
+mv "$T/etc/relrotate.conf.bak" "$T/etc/relrotate.conf"
+
+echo "== setup"
+rm -f "$T/etc/discord.url"
+cp "$T/etc/relrotate.conf" "$T/etc/relrotate.conf.bak"
+check "setup with notifications already set says so" bash -c "'$RR' setup </dev/null | grep -q 'already set'"
+check "  and changes nothing" cmp -s "$T/etc/relrotate.conf" "$T/etc/relrotate.conf.bak"
+printf '# top\nMAIL_TO=""\nNOTIFY=()\n# end\n' > "$T/etc/relrotate.conf"; cp "$T/etc/relrotate.conf" "$T/etc/empty.conf"
+check "setup at end of input changes nothing" bash -c "'$RR' setup </dev/null >/dev/null && cmp -s '$T/etc/relrotate.conf' '$T/etc/empty.conf'"
+check "setup answered no twice changes nothing" bash -c "printf 'n\n\n' | '$RR' setup >/dev/null && cmp -s '$T/etc/relrotate.conf' '$T/etc/empty.conf'"
+check "setup refuses a URL that is not https (exit 2)" test "$(printf 'n\ny\ndiscord\nhttp://x.example/hook\n' | rc_of "$RR" setup)" = 2
+check "  and writes no URL file" test ! -e "$T/etc/discord.url"
+check "setup refuses an unknown kind (exit 2)" test "$(printf 'n\ny\nslack\n' | rc_of "$RR" setup)" = 2
+check "setup refuses a bad mail address (exit 2)" test "$(printf 'y\nroot example\n' | rc_of "$RR" setup)" = 2
+check "  the config is still untouched" cmp -s "$T/etc/relrotate.conf" "$T/etc/empty.conf"
+check "setup does not print the URL" bash -c "! printf 'n\ny\nwebhook\nhttps://hook.example/s3cret\n' | '$RR' setup 2>&1 | grep -q s3cret"
+cp "$T/etc/empty.conf" "$T/etc/relrotate.conf"; rm -f "$T/etc/webhook.url"
+echo old > "$T/etc/discord.url"; chmod 644 "$T/etc/discord.url"   # a leftover, loose file
+check "setup with mail and discord" bash -c "printf 'y\nops@example.net\ny\n\nhttps://discord.example/api/webhooks/1/tok\n' | '$RR' setup >/dev/null"
+check "  MAIL_TO written in place" bash -c "sed -n 2p '$T/etc/relrotate.conf' | grep -qx 'MAIL_TO=\"ops@example.net\"'"
+check "  NOTIFY written in place" bash -c "sed -n 3p '$T/etc/relrotate.conf' | grep -qx 'NOTIFY=(discord:$T/etc/discord.url)'"
+check "  other lines kept" bash -c "test \"\$(sed -n '1p;4p' '$T/etc/relrotate.conf' | tr '\n' ' ')\" = '# top # end '"
+check "  URL file holds the URL, mode 600" bash -c "test \"\$(cat '$T/etc/discord.url')\" = https://discord.example/api/webhooks/1/tok && test \"\$(stat -c %a '$T/etc/discord.url')\" = 600"
+check "  doctor accepts the result" bash -c "'$RR' doctor web 2>&1 | grep -q 'ok    discord destination file readable'"
+check "setup has no --dry-run" test "$(rc_of "$RR" setup -n)" = 2
+rm -f "$T/etc/discord.url" "$T/etc/webhook.url" "$T/etc/empty.conf"; mv "$T/etc/relrotate.conf.bak" "$T/etc/relrotate.conf"
+
+echo "== large release list"
+# headscale's list is 2.5 MB; a per-character bash rewrite of it took minutes.
+jq '.[0].body = ("release notes line with words\n" * 85000)' "$T/releases.json" > "$T/releases-big.json"
+check "check finishes on a 2.5 MB release list" \
+    bash -c "STUB_RELEASES='$T/releases-big.json' timeout 30 '$RR' check web 2>/dev/null | grep -q '^newest'"
+
+echo "== doctor says whether backups are taken"
+web_recipe minor api-digest
+check "no backup hook: doctor says so" bash -c "'$RR' doctor web 2>&1 | grep -q 'note  no backup hook: updates take no backup'"
+echo "pre_update() { backup_sqlite '$T/none.db' db; }" >> "$T/etc/apps.d/web.conf"
+check "backup hook: doctor says a backup runs and how to turn it off" \
+    bash -c "'$RR' doctor web 2>&1 | grep -q 'note  a hook takes a backup before every update, to .*remove the hook'"
+web_recipe minor api-digest
 
 echo "== status --json"
 out="$("$RR" status --json)"
@@ -2144,6 +2210,219 @@ backup_recipe "backup_pg pg-ctr postgres app" "current_version() { echo 1.2.3-rc
 check "a prerelease version is made safe in the file name" \
     bash -c "'$RR' update web 2>/dev/null; ls '$bk' | grep -qxE \"app-1\\.2\\.3_rc1-[0-9]{14}\\.sql\\.gz\""
 rm -rf "$bk"; web_recipe minor api-digest
+
+echo "== rootless quadlet: its owner's account does the file work"
+reset_logs; rm -rf "$T/state/rl"
+printf '[Container]\nImage=ghcr.io/example/demo:v1.2.3\nPublishPort=8080:8080\n' > "$T/quadlet/rl.container"
+chmod 600 "$T/quadlet/rl.container"
+cat > "$T/etc/apps.d/rl.conf" <<EOF
+SOURCE=github:example/demo
+POLICY=minor
+LAYOUT=container
+QUADLET=$T/quadlet/rl.container
+QUADLET_USER=tenant
+IMAGE='ghcr.io/example/demo:\${TAG}'
+SERVICE=rl.service
+HEALTH_RETRIES=1
+HEALTH_DELAY=0
+EOF
+check "the version is read" bash -c "'$RR' check rl 2>/dev/null | grep -q '^installed *1.2.3'"
+check "  through the owner's account, not by root" grep -qx "runuser -u tenant -- cat -- $T/quadlet/rl.container" "$T/log/runuser"
+reset_logs
+check "update exits 0" "$RR" update rl
+check "  Image= bumped, other lines kept" bash -c "grep -qx 'Image=ghcr.io/example/demo:v1.3.0' '$T/quadlet/rl.container' && grep -qx 'PublishPort=8080:8080' '$T/quadlet/rl.container'"
+check "  the quadlet was written by the owner's account" grep -q "^runuser -u tenant -- bash -c .* bash $T/quadlet/rl.container\$" "$T/log/runuser"
+check "  its mode is unchanged" test "$(stat -c %a "$T/quadlet/rl.container")" = 600
+check "  nothing is left next to it" bash -c "! ls '$T/quadlet' | grep -q 'rl.container.'"
+reset_logs
+check "rollback puts the old quadlet back" bash -c "'$RR' rollback rl 2>/dev/null && grep -qx 'Image=ghcr.io/example/demo:v1.2.3' '$T/quadlet/rl.container'"
+check "  also through the owner's account" grep -q "^runuser -u tenant -- bash -c .* bash $T/quadlet/rl.container\$" "$T/log/runuser"
+# a quadlet the owner's account cannot read: reported, not worked around as root
+printf '#!/usr/bin/env bash\nexit 1\n' > "$T/bin/runuser.fail"; chmod +x "$T/bin/runuser.fail"
+mv "$T/bin/runuser" "$T/bin/runuser.ok"; mv "$T/bin/runuser.fail" "$T/bin/runuser"
+rm -f "$T/state/rl/installed"
+check "when the owner's account cannot read the quadlet, the version is unknown" \
+    bash -c "'$RR' check rl 2>/dev/null | grep -q '^installed *unknown'"
+mv "$T/bin/runuser.ok" "$T/bin/runuser"
+rm -f "$T/etc/apps.d/rl.conf" "$T/quadlet/rl.container"; rm -rf "$T/state/rl"
+
+echo "== adopt <app>: take over an existing install"
+reset_logs
+rm -rf "$T/ex" "$T/qd" "$T/upd" "$T/units" "$T/opt"
+mkdir -p "$T/ex" "$T/qd" "$T/upd/systemd" "$T/upd/cron.d" "$T/units" "$T/opt/sapp/releases/1.0.0/bin"
+export RELROTATE_EXAMPLES_DIR="$T/ex" RELROTATE_QUADLET_DIRS="$T/qd $T/nowhere/*" \
+       RELROTATE_UPDATER_DIRS="$T/upd/systemd $T/upd/cron.d"
+adopt_out() { "$RR" adopt "$@" 2>&1 || true; }
+has() { grep -q -- "$1" <<<"$out"; }
+not_has() { ! grep -q -- "$1" <<<"$out"; }
+# a recipe exists: the version is read and recorded
+web_install_old; web_recipe minor api-digest
+check "with a recipe: the installed version is read and recorded" \
+    bash -c "'$RR' adopt web 2>&1 | grep -q 'web: recorded installed version 1.2.3' && test \"\$(cat '$T/state/web/installed')\" = 1.2.3"
+cp "$T/etc/apps.d/web.conf" "$T/web.conf.before"
+check "  the recipe is not touched" bash -c "'$RR' adopt web >/dev/null 2>&1; cmp -s '$T/etc/apps.d/web.conf' '$T/web.conf.before'"
+check "  --source with an existing recipe is refused (exit 2)" test "$(rc_of "$RR" adopt --source github:example/demo web)" = 2
+check "--source with another command is refused (exit 2)" test "$(rc_of "$RR" check --source github:example/demo web)" = 2
+check "--source must look like a source (exit 2)" test "$(rc_of "$RR" adopt --source 'github:a/b;id' capp)" = 2
+# nothing to go on
+check "no recipe, no example, no --source: exit 2" test "$(rc_of "$RR" adopt capp)" = 2
+check "  and no recipe is left" bash -c "! ls '$T/etc/apps.d' | grep -q '^capp'"
+check "--source but nothing on the host: exit 2, no recipe" \
+    bash -c "test \"\$('$RR' adopt --source github:example/demo capp >/dev/null 2>&1; echo \$?)\" = 2 && ! ls '$T/etc/apps.d' | grep -q '^capp'"
+# a quadlet
+printf '[Container]\nImage=ghcr.io/example/demo:v1.2.3\nAutoUpdate=registry\n' > "$T/qd/capp.container"
+touch "$T/upd/systemd/capp-update.timer" "$T/upd/systemd/capp-update.service" "$T/upd/systemd/other.timer"
+echo "15 4 * * * root /usr/local/sbin/update-capp" > "$T/upd/cron.d/nightly"
+out="$(adopt_out --source github:example/demo capp)"
+check "quadlet: recipe written" test -s "$T/etc/apps.d/capp.conf"
+check "  container layout, quadlet path, image template, service" bash -c "
+    grep -qx 'LAYOUT=container' '$T/etc/apps.d/capp.conf' &&
+    grep -qx \"QUADLET='$T/qd/capp.container'\" '$T/etc/apps.d/capp.conf' &&
+    grep -qx \"IMAGE='ghcr.io/example/demo:\\\${TAG}'\" '$T/etc/apps.d/capp.conf' &&
+    grep -qx \"SERVICE='capp.service'\" '$T/etc/apps.d/capp.conf' &&
+    grep -qx 'SOURCE=github:example/demo' '$T/etc/apps.d/capp.conf'"
+check "  installed version recorded from the image tag" test "$(cat "$T/state/capp/installed")" = 1.2.3
+check "  the old timer is listed with how to turn it off" grep -q 'capp-update.timer   turn off: systemctl disable --now capp-update.timer' <<<"$out"
+check "  the cron file that mentions the app is listed" grep -q "old updater? $T/upd/cron.d/nightly mentions capp" <<<"$out"
+check "  AutoUpdate= in the quadlet is listed" grep -q 'sets AutoUpdate=' <<<"$out"
+check "  an unrelated timer is not listed" not_has other.timer
+check "  nothing was turned off or restarted" bash -c "! grep -Eq 'disable|restart|daemon-reload' '$T/log/systemctl' 2>/dev/null"
+check "  the doctor checks ran" has 'ok    release check'
+check "  the next steps are printed" has 'relrotate enable capp'
+check "  the written recipe works: check finds the candidate" bash -c "'$RR' check capp 2>/dev/null | grep -q '^candidate *1.3.0'"
+cp "$T/etc/apps.d/capp.conf" "$T/capp.conf.before"
+check "adopt again: recipe unchanged, version already recorded" \
+    bash -c "'$RR' adopt capp 2>&1 | grep -q 'already recorded' && cmp -s '$T/etc/apps.d/capp.conf' '$T/capp.conf.before'"
+# a quadlet on :latest
+printf '[Container]\nImage=ghcr.io/example/demo:latest\n' > "$T/qd/lapp.container"
+check "quadlet on :latest: recipe written, version unknown, exit 2" \
+    bash -c "out=\$('$RR' adopt --source github:example/demo lapp 2>&1); test \$? = 2 && grep -q 'must carry a version tag' <<<\"\$out\" && test -s '$T/etc/apps.d/lapp.conf'"
+# a hostile Image= value must not reach a file that root sources
+# shellcheck disable=SC2016  # the $( ) must stay literal: it is the attack
+printf '[Container]\nImage=ghcr.io/$(touch %s/pwned)/demo:v1.0.0\n' "$T" > "$T/qd/happ.container"
+check "hostile Image= value: refused (exit 2), no recipe" \
+    bash -c "'$RR' adopt --source github:example/demo happ >/dev/null 2>&1; test \$? = 2 && ! ls '$T/etc/apps.d' | grep -q '^happ'"
+check "  and nothing was run" test ! -e "$T/pwned"
+# a shipped example: its IMAGE and hooks stay, the host's quadlet path goes in
+cat > "$T/ex/eapp.conf" <<'EOF'
+SOURCE=github:example/demo
+POLICY="patch"
+LAYOUT=container
+QUADLET=/etc/containers/systemd/eapp.container
+IMAGE='ghcr.io/example/demo:${TAG}'
+SERVICE=eapp.service
+# BACKUP_DIR=/var/lib/eapp/backups
+# pre_update() { backup_sqlite /var/lib/eapp/db.sqlite db; }
+EOF
+printf '[Container]\nImage=ghcr.io/example/demo:v1.2.3\n' > "$T/qd/eapp.container"
+out="$(adopt_out eapp)"
+check "shipped example: used without --source" grep -q 'recipe starts from the shipped example' <<<"$out"
+check "  the example's policy is kept, the quadlet path is the host's" \
+    bash -c "grep -qx 'POLICY=\"patch\"' '$T/etc/apps.d/eapp.conf' && grep -qx \"QUADLET='$T/qd/eapp.container'\" '$T/etc/apps.d/eapp.conf'"
+check "  says that backups are off and the hook is commented out" grep -q 'no backup is taken before an update' <<<"$out"
+# a unit whose program sits under a symlinked directory
+ln -s "$T/opt/sapp/releases/1.0.0" "$T/opt/sapp/current"; touch "$T/opt/sapp/releases/1.0.0/bin/sapp"
+printf '[Service]\nExecStart=-%s/opt/sapp/current/bin/sapp serve --port 1\n' "$T" > "$T/units/sapp.service"
+jq -n '[{tag_name: "v1.3.0", draft: false, prerelease: false, assets: [
+        {name: "sapp_1.3.0_linux_amd64.tar.gz", browser_download_url: "file:///x", digest: "sha256:00"},
+        {name: "sapp_1.3.0_linux_arm64.tar.gz", browser_download_url: "file:///x", digest: "sha256:00"},
+        {name: "sapp_1.3.0_darwin_amd64.tar.gz", browser_download_url: "file:///x", digest: "sha256:00"},
+        {name: "sapp_1.3.0_darwin_arm64.tar.gz", browser_download_url: "file:///x", digest: "sha256:00"},
+        {name: "checksums.txt", browser_download_url: "file:///x"}]}]' > "$T/releases-sapp.json"
+out="$(STUB_RELEASES="$T/releases-sapp.json" adopt_out --source github:example/sapp sapp)"
+check "unit under a symlinked dir: symlink layout with TARGET and RELEASES_DIR" bash -c "
+    grep -qx 'LAYOUT=symlink' '$T/etc/apps.d/sapp.conf' &&
+    grep -qx \"TARGET='$T/opt/sapp/current'\" '$T/etc/apps.d/sapp.conf' &&
+    grep -qx \"RELEASES_DIR='$T/opt/sapp/releases'\" '$T/etc/apps.d/sapp.conf'"
+case "$(uname -m)" in x86_64|amd64|aarch64|arm64)
+check "  the one release file for this host becomes ASSET; VERIFY from the API digest" bash -c "
+    grep -qx \"ASSET='sapp_\\\${VERSION}_linux_\\\${ARCH}.tar.gz'\" '$T/etc/apps.d/sapp.conf' &&
+    grep -qx 'VERIFY=\"api-digest\"' '$T/etc/apps.d/sapp.conf'"
+check "  version read from the link" test "$(cat "$T/state/sapp/installed" 2>/dev/null)" = 1.0.0
+;; esac
+# a plain binary, release files that do not single one out
+touch "$T/opt/bapp"
+printf '[Service]\nExecStart=%s/opt/bapp\n' "$T" > "$T/units/bapp.service"
+jq -n '[{tag_name: "v1.3.0", draft: false, prerelease: false, assets: [
+        {name: "bapp-1.3.0.tar.gz", browser_download_url: "file:///x"}]}]' > "$T/releases-bapp.json"
+out="$(STUB_RELEASES="$T/releases-bapp.json" adopt_out --source github:example/demo bapp)"
+check "plain binary, no single release file: binary layout, candidates listed, adopt stops" bash -c "
+    grep -qx 'LAYOUT=binary' '$T/etc/apps.d/bapp.conf' && grep -qx \"TARGET='$T/opt/bapp'\" '$T/etc/apps.d/bapp.conf' &&
+    grep -q '^# ASSET: 0 release files fit this host' '$T/etc/apps.d/bapp.conf'"
+check "  adopt says the recipe is not complete" has 'the recipe is not complete yet'
+check "  exit 1" test "$(rc_of "$RR" adopt bapp)" = 1
+# values that must not be taken at face value
+printf "[Container]\nImage=ghcr.io/a'b/demo:v1.0.0\n" > "$T/qd/qapp.container"
+check "a quote in the Image= value: refused (exit 2), no recipe" \
+    bash -c "'$RR' adopt --source github:example/demo qapp >/dev/null 2>&1; test \$? = 2 && ! ls '$T/etc/apps.d' | grep -q '^qapp'"
+printf '[Container]\nImage=ghcr.io/example/demo:v1.2.3@sha256:abcd\n' > "$T/qd/dapp.container"
+out="$(adopt_out --source github:example/demo dapp)"
+check "an image with a digest: the template has no digest, the version is read" bash -c "
+    grep -qx \"IMAGE='ghcr.io/example/demo:\\\${TAG}'\" '$T/etc/apps.d/dapp.conf' && test \"\$(cat '$T/state/dapp/installed')\" = 1.2.3"
+printf '[Container]\nImage=ghcr.io/example/demo:1.2.3-alpine\n' > "$T/qd/xapp.container"
+out="$(adopt_out --source github:example/demo xapp)"
+check "a tag with a suffix is not turned into a template silently" has "the image tag '1.2.3-alpine' is not a plain version"
+printf '[Service]\nExecStart=/usr/bin/env FOO=1 %s/opt/bapp\n' "$T" > "$T/units/wapp.service"
+out="$(adopt_out --source github:example/demo wapp)"
+check "a unit that starts a system program (wrapper): not taken as the app" has 'a system program: not taken as the app'
+check "  and no recipe names it as TARGET" bash -c "! ls '$T/etc/apps.d' | grep -q '^wapp'"
+ln -s "$T/opt" "$T/lnk"
+printf '[Service]\nExecStart=%s/lnk/bapp\n' "$T" > "$T/units/papp.service"
+out="$(STUB_RELEASES="$T/releases-bapp.json" adopt_out --source github:example/demo papp)"
+check "a symlink on the way that is no release link: binary layout, not symlink" bash -c "
+    grep -qx 'LAYOUT=binary' '$T/etc/apps.d/papp.conf' && grep -qx \"TARGET='$T/lnk/bapp'\" '$T/etc/apps.d/papp.conf'"
+ln -s capp.container "$T/qd/zapp.container"
+check "a quadlet that is a symlink is not used" \
+    bash -c "'$RR' adopt --source github:example/demo zapp >/dev/null 2>&1; test \$? = 2 && ! ls '$T/etc/apps.d' | grep -q '^zapp'"
+printf '[Container]\nImage=ghcr.io/example/demo:v1.2.3\n' > "$T/qd/uapp.container"
+printf '[Service]\nExecStart=%s/opt/bapp\n' "$T" > "$T/units/uapp.service"
+out="$(STUB_RELEASES="$T/releases-bapp.json" adopt_out --source github:example/demo uapp)"
+check "the app's own unit wins over a quadlet outside /etc" has "uapp.container ignored: uapp.service starts"
+check "  binary layout is written" grep -qx 'LAYOUT=binary' "$T/etc/apps.d/uapp.conf"
+rm -f "$T/lnk"
+for a in qapp dapp xapp wapp papp zapp uapp; do rm -rf "$T/etc/apps.d/$a.conf" "$T/state/$a"; done
+unset RELROTATE_EXAMPLES_DIR
+check "the shipped examples are found next to the script" bash -c "
+    rm -f '$T/etc/apps.d/npmplus.conf'; '$RR' adopt npmplus >/dev/null 2>&1
+    grep -q '^SOURCE=github:ZoeyVid/NPMplus' '$T/etc/apps.d/npmplus.conf'"
+check "no shipped example has a backup hook switched on" \
+    bash -c "! grep -l '^pre_update() { backup_' '$here'/../examples/apps.d/*.conf"
+for a in capp lapp happ eapp sapp bapp npmplus; do rm -rf "$T/etc/apps.d/$a.conf" "$T/state/$a"; done
+rm -rf "$T/ex" "$T/qd" "$T/upd" "$T/units" "$T/opt" "$T"/*.conf.before "$T/releases-sapp.json" "$T/releases-bapp.json"
+unset RELROTATE_QUADLET_DIRS RELROTATE_UPDATER_DIRS
+
+echo "== date tags: VERSION_REGEX with groups v1..v4"
+reset_logs; rm -rf "$T/state/dt"
+printf '[Container]\nImage=docker.io/example/dt:2026-10-22-r1\n' > "$T/quadlet/dt.container"
+jq -n '["2026-11-18-r1", "2026-10-22-r2", "2026-10-22-r1", "2026-07-24-r1", "develop"]
+    | map({tag_name: ., draft: false, prerelease: false, published_at: "2026-01-01T00:00:00Z", assets: []})' \
+    > "$T/releases-dt.json"
+cat > "$T/etc/apps.d/dt.conf" <<EOF
+SOURCE=github:example/dt
+VERSION_REGEX='^(?<v1>[0-9]{4})-(?<v2>[0-9]{2})-(?<v3>[0-9]{2})-r(?<v4>[0-9]+)\$'
+POLICY=major
+LAYOUT=container
+QUADLET=$T/quadlet/dt.container
+IMAGE='docker.io/example/dt:\${TAG}'
+SERVICE=dt.service
+HEALTH_RETRIES=1
+HEALTH_DELAY=0
+EOF
+export STUB_RELEASES="$T/releases-dt.json"
+check "installed version read from the quadlet's date tag" bash -c "'$RR' check dt 2>/dev/null | grep -q '^installed *2026\.10\.22\.1$'"
+check "newest is the latest date" bash -c "'$RR' check dt 2>/dev/null | grep -q '^newest *2026\.11\.18\.1$'"
+jq 'del(.[0])' "$T/releases-dt.json" > "$T/releases-dt2.json"
+check "a second release on the same day (r2) is newer than r1" \
+    bash -c "STUB_RELEASES='$T/releases-dt2.json' '$RR' check dt 2>/dev/null | grep -q '^candidate *2026\.10\.22\.2$'"
+check "update exits 0" "$RR" update dt
+check "  Image= carries the upstream tag, not the version" grep -qx 'Image=docker.io/example/dt:2026-11-18-r1' "$T/quadlet/dt.container"
+check "  state records the version" test "$(cat "$T/state/dt/installed")" = 2026.11.18.1
+check "rollback puts the old date tag back" bash -c "'$RR' rollback dt 2>/dev/null && grep -qx 'Image=docker.io/example/dt:2026-10-22-r1' '$T/quadlet/dt.container'"
+unset STUB_RELEASES
+jq '[{tag_name: "v9.9.9.9", draft: false, prerelease: false, assets: []}] + .' "$T/releases.json" > "$T/releases-4.json"
+check "without VERSION_REGEX a four-part tag is still not a version" \
+    bash -c "out=\$(STUB_RELEASES='$T/releases-4.json' '$RR' check web 2>/dev/null) && grep -q '^newest' <<<\"\$out\" && ! grep -q '9\.9\.9\.9' <<<\"\$out\""
+rm -f "$T/etc/apps.d/dt.conf" "$T/quadlet/dt.container" "$T"/releases-dt*.json "$T/releases-4.json"; rm -rf "$T/state/dt"
 
 echo
 echo "passed: $pass  failed: $fail"

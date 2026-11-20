@@ -9,9 +9,14 @@
 #   check   <app>          show installed / candidate version, change nothing
 #   update  <app>          update if policy allows (what the timer runs)
 #   rollback <app>         go back to the previous installed version
-#   adopt   <app> <ver>    record the currently installed version (first run)
+#   adopt   <app> [ver]    record the installed version; without ver: take over
+#                          an existing install (writes the recipe if there is
+#                          none, from the shipped example or --source)
 #   hold    <app> [reason] keep the app on its version until unhold
 #   unhold  <app>          let updates run again
+#   enable  <app>          turn on the app's timer (relrotate@<app>.timer)
+#   disable <app>          turn the timer off
+#   setup                  ask where notifications go, if nothing is set yet
 #   status  [app]          show state for one or all apps (--json for scripts)
 #   doctor  [app]          check recipes, releases and paths; change nothing
 #   list                   list configured apps
@@ -20,13 +25,14 @@
 # Options:
 #   -n, --dry-run          download and verify, but do not install or flip
 #   --json                 status: one JSON array
+#   --source <kind:spec>   adopt: where releases are, e.g. github:owner/repo
 #   -v, --verbose          debug logging
 #   -h, --help
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-RELROTATE_VERSION="0.3.0"
+RELROTATE_VERSION="0.4.0"
 
 # Locations (overridable for tests and non-standard installs)
 LIB_DIR="${RELROTATE_LIB_DIR:-}"
@@ -41,6 +47,14 @@ if [[ -z "$LIB_DIR" ]]; then
     fi
 fi
 CONF_DIR="${RELROTATE_CONF_DIR:-/etc/relrotate}"
+# The shipped example recipes: next to the script in a checkout, under
+# PREFIX/share/relrotate when installed.
+EXAMPLES_DIR="${RELROTATE_EXAMPLES_DIR:-}"
+if [[ -z "$EXAMPLES_DIR" ]]; then
+    for d in "$LIB_DIR/../examples/apps.d" "$LIB_DIR/../../share/relrotate/examples/apps.d"; do
+        if [[ -d "$d" ]]; then EXAMPLES_DIR="$d"; break; fi
+    done
+fi
 STATE_ROOT="${RELROTATE_STATE_DIR:-/var/lib/relrotate}"
 
 # shellcheck source=lib/common.sh
@@ -59,6 +73,8 @@ STATE_ROOT="${RELROTATE_STATE_DIR:-/var/lib/relrotate}"
 . "$LIB_DIR/outcome.sh"
 # shellcheck source=lib/transaction.sh
 . "$LIB_DIR/transaction.sh"
+# shellcheck source=lib/adopt.sh
+. "$LIB_DIR/adopt.sh"
 # shellcheck source=lib/backup.sh
 . "$LIB_DIR/backup.sh"
 
@@ -245,6 +261,55 @@ cmd_unhold() {
     echo "$APP: updates run again"
 }
 
+# enable|disable APP: the app's timer, so nobody has to type the unit name.
+cmd_timer() {
+    load_recipe "$2"
+    "$SYSTEMCTL" "$1" --now "relrotate@$APP.timer" || die 1 "$APP: systemctl $1 relrotate@$APP.timer failed"
+    log info event="timer-$1"
+    echo "$APP: relrotate@$APP.timer ${1}d"
+    [[ "$1" != enable || -n "$MAIL_TO" ]] || (( ${#NOTIFY[@]} )) \
+        || echo "$APP: results go to the journal only; for mail or chat set MAIL_TO or NOTIFY in $CONF_DIR/relrotate.conf"
+}
+
+conf_set() { file_set "$CONF_DIR/relrotate.conf" "$1" "$2"; }
+
+# setup: ask where notifications go, when nothing is set yet. Answers come
+# from stdin (install.sh runs this on a terminal); end of input means no.
+cmd_setup() {
+    local conf="$CONF_DIR/relrotate.conf" a kind url f
+    if [[ -n "$MAIL_TO" ]] || (( ${#NOTIFY[@]} )); then
+        echo "notifications are already set; edit $conf to change them"; return 0
+    fi
+    [[ -w "$conf" ]] || die 1 "cannot write $conf"
+    read -r -p "Email notifications? [y/N] " a || a=""
+    if [[ "$a" == [yY]* ]]; then
+        read -r -p "Send mail to: " a || a=""
+        [[ "$a" =~ ^[A-Za-z0-9._%+@-]+$ ]] || die 2 "not a mail address: $a"
+        conf_set MAIL_TO "\"$a\"" || die 1 "cannot write $conf"
+        echo "mail goes to $a"
+    fi
+    read -r -p "Chat or webhook notifications (discord, ntfy, webhook)? [y/N] " a || a=""
+    if [[ "$a" == [yY]* ]]; then
+        read -r -p "Kind [discord]: " kind || kind=""
+        kind="${kind:-discord}"
+        case "$kind" in
+            discord|ntfy|webhook) ;;
+            telegram) die 2 "telegram needs a token and a chat id: see Notifications in the README" ;;
+            *) die 2 "unknown kind: $kind (discord, ntfy or webhook)" ;;
+        esac
+        # -s: the URL is a secret, keep it off the screen
+        read -r -s -p "URL (not shown): " url || url=""
+        [[ ! -t 0 ]] || echo
+        [[ "$url" =~ ^https://[^[:space:]\"]+$ ]] || die 2 "the URL must start with https://"
+        f="$CONF_DIR/$kind.url"
+        # chmod too: an existing file keeps its mode through the umask
+        { ( umask 077; printf '%s\n' "$url" > "$f" ) && chmod 0600 "$f"; } || die 1 "cannot write $f"
+        conf_set NOTIFY "($kind:$f)" || die 1 "cannot write $conf"
+        echo "$kind notifications use $f"
+    fi
+    echo "check with: relrotate doctor"
+}
+
 # One app's state as JSON; the text status is printed from it.
 status_json() {
     local STATE_DIR="$STATE_ROOT/$1" f
@@ -377,6 +442,7 @@ doctor_app() {
     # fetch_releases exits on failure: run it in a subshell, keep its result
     # and its stderr (the reason, last line on failure), so one request serves both.
     local out
+    doctor_note "asking $SOURCE for releases"
     if out="$(fetch_releases 2>&1; printf '\n@@%s' "$RELEASES")"; then
         RELEASES="${out##*$'\n'@@}"
     else
@@ -437,7 +503,11 @@ doctor_backups() {
         if command -v "$PODMAN" >/dev/null 2>&1; then doctor_ok "podman for backup_pg"
         else doctor_bad "a hook calls backup_pg but podman is not installed"; fi
     fi
-    [[ "$hooks" != *backup_* ]] || doctor_note "backups go to ${BACKUP_DIR:-$STATE_DIR/backups} (newest $BACKUP_KEEP kept)"
+    if [[ "$hooks" == *backup_* ]]; then
+        doctor_note "a hook takes a backup before every update, to ${BACKUP_DIR:-$STATE_DIR/backups} (newest $BACKUP_KEEP kept); remove the hook from the recipe to turn it off"
+    else
+        doctor_note "no backup hook: updates take no backup (README: Hooks, backup helpers)"
+    fi
 }
 
 doctor_paths() { layout doctor; }
@@ -470,13 +540,17 @@ cmd_update_all() {
 
 usage_err() { log err msg="$1"; usage >&2; exit 2; }
 
-DRY_RUN=0 JSON=0
+DRY_RUN=0 JSON=0 SOURCE_OPT=""
 args=()
 while (( $# )); do
     case "$1" in
         -n|--dry-run) DRY_RUN=1 ;;
         -v|--verbose) RELROTATE_DEBUG=1 ;;
         --json) JSON=1 ;;
+        --source)
+            [[ $# -ge 2 && "$2" =~ ^(github:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+|(gitea|forgejo):https?://[A-Za-z0-9._:/-]+)$ ]] \
+                || usage_err "--source takes github:owner/repo or gitea:https://host/owner/repo"
+            SOURCE_OPT="$2"; shift ;;
         -h|--help) usage; exit 0 ;;
         --version) echo "relrotate $RELROTATE_VERSION"; exit 0 ;;
         -*) usage_err "unknown option: $1" ;;
@@ -492,18 +566,25 @@ require_tools
 cmd="${1:-}"; shift || true
 # -n would be silently ignored here, and these commands write state.
 case "$cmd" in
-    adopt|rollback|hold|unhold|digest) (( ! DRY_RUN )) || usage_err "$cmd has no --dry-run" ;;
+    adopt|rollback|hold|unhold|enable|disable|setup|digest) (( ! DRY_RUN )) || usage_err "$cmd has no --dry-run" ;;
 esac
 [[ "$cmd" == status ]] || (( ! JSON )) || usage_err "--json is for status only"
+[[ "$cmd" == adopt || -z "$SOURCE_OPT" ]] || usage_err "--source is for adopt only"
 case "$cmd" in
     check)      [[ $# -eq 1 ]] || usage_err "usage: relrotate check <app>"; cmd_check "$1" ;;
     update)     [[ $# -eq 1 ]] || usage_err "usage: relrotate update <app>"; cmd_update "$1" ;;
     rollback)   [[ $# -eq 1 ]] || usage_err "usage: relrotate rollback <app>"; cmd_rollback "$1" ;;
-    adopt)      [[ $# -eq 2 ]] || usage_err "usage: relrotate adopt <app> <version>"; cmd_adopt "$1" "$2" ;;
+    adopt)      [[ $# -ge 1 && $# -le 2 ]] || usage_err "usage: relrotate adopt [--source kind:spec] <app> [version]"
+                if [[ $# -eq 2 ]]; then
+                    [[ -z "$SOURCE_OPT" ]] || usage_err "--source is for adopt without a version"
+                    cmd_adopt "$1" "$2"
+                else adopt_takeover "$1"; fi ;;
     hold)       [[ $# -ge 1 && $# -le 2 ]] || usage_err "usage: relrotate hold <app> [reason]"; cmd_hold "$1" "${2:-}" ;;
     unhold)     [[ $# -eq 1 ]] || usage_err "usage: relrotate unhold <app>"; cmd_unhold "$1" ;;
+    enable|disable) [[ $# -eq 1 ]] || usage_err "usage: relrotate $cmd <app>"; cmd_timer "$cmd" "$1" ;;
     status)     [[ $# -le 1 ]] || usage_err "usage: relrotate status [app]"; cmd_status "${1:-}" ;;
     doctor)     [[ $# -le 1 ]] || usage_err "usage: relrotate doctor [app]"; cmd_doctor "${1:-}" ;;
+    setup)      [[ $# -eq 0 ]] || usage_err "usage: relrotate setup"; cmd_setup ;;
     digest)     [[ $# -eq 0 ]] || usage_err "usage: relrotate digest"; cmd_digest ;;
     list)       [[ $# -eq 0 ]] || usage_err "usage: relrotate list"; list_apps ;;
     update-all) [[ $# -eq 0 ]] || usage_err "usage: relrotate update-all"; cmd_update_all ;;
