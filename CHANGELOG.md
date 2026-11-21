@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 (2026-11-21)
+
+- Releases carry `relrotate-X.Y.Z-1.noarch.rpm` for RHEL 9/10, their clones
+  and Fedora, built from `relrotate.spec` by the release workflow; unsigned,
+  listed in `SHA256SUMS` (#109).
+
 ## 0.4.0 (2026-11-20)
 
 - `VERSION_REGEX` with groups `v1`..`v4` reads date-style tags

@@ -1,5 +1,6 @@
 # On a v* tag push (GitHub only: Forgejo reads .forgejo/workflows), build
-# relrotate-X.Y.Z.tar.gz from the tag plus SHA256SUMS and open a draft
+# relrotate-X.Y.Z.tar.gz from the tag, relrotate-X.Y.Z-1.noarch.rpm from
+# that tarball (relrotate.spec), plus SHA256SUMS, and open a draft
 # release with that version's CHANGELOG section. Publishing is manual.
 name: release
 
@@ -31,7 +32,14 @@ jobs:
           mkdir dist
           git archive --format=tar.gz --prefix="relrotate-$v/" \
             -o "dist/relrotate-$v.tar.gz" HEAD
-          (cd dist && sha256sum "relrotate-$v.tar.gz" > SHA256SUMS)
+          # One noarch RPM for EL9, EL10 and Fedora, built on the oldest of them.
+          docker run --rm -v "$PWD/dist:/dist" -e v="$v" almalinux:9 bash -euo pipefail -c '
+            dnf -y -q install rpm-build systemd-rpm-macros
+            rpmbuild -ta "/dist/relrotate-$v.tar.gz" --define "_rpmdir /dist" \
+              --define "_build_name_fmt %%{NAME}-%%{VERSION}-%%{RELEASE}.%%{ARCH}.rpm" \
+              --define "dist %{nil}"'
+          [[ -s "dist/relrotate-$v-1.noarch.rpm" ]] || { echo "::error::no RPM was built"; exit 1; }
+          (cd dist && sha256sum "relrotate-$v.tar.gz" "relrotate-$v-1.noarch.rpm" > SHA256SUMS)
           awk -v h="## $v" 'index($0, h) == 1 {on = 1; next} on && /^## / {exit} on' \
             CHANGELOG.md > notes.md
           [[ -s notes.md ]] || { echo "::error::no CHANGELOG section for $v"; exit 1; }
@@ -45,4 +53,4 @@ jobs:
         run: |
           gh release create "$TAG" --draft --verify-tag \
             --title "relrotate $v" --notes-file notes.md \
-            "dist/relrotate-$v.tar.gz" dist/SHA256SUMS
+            "dist/relrotate-$v.tar.gz" "dist/relrotate-$v-1.noarch.rpm" dist/SHA256SUMS

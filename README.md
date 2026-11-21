@@ -84,6 +84,21 @@ cd relrotate
 sudo ./install.sh
 ```
 
+Or, on RHEL 9/10, their clones and Fedora, the RPM from the
+[release page](https://github.com/raatti/relrotate/releases) (from 0.4.1 on):
+
+```bash
+sudo dnf install ./relrotate-X.Y.Z-1.noarch.rpm
+```
+
+The RPM is unsigned: check it against `SHA256SUMS` from the same release.
+It installs under `/usr` where `install.sh` uses `/usr/local`; recipes,
+`relrotate.conf` and state are in the same places. Use one or the other:
+an `install.sh` copy wins over the RPM (units in `/etc/systemd/system`,
+`/usr/local/sbin` first in root's `PATH`), so remove it first (see
+Uninstall, without the `rm -rf` of state and recipes). `relrotate setup`
+is not run by the RPM.
+
 Needs bash 5.1 or newer (the bash of RHEL 9), `curl`, `jq`, `coreutils` (incl. `timeout`), `tar`, `util-linux` (flock, runuser);
 optional: `gpgv` for signature checks, `unzip`/`xz`/`bzip2` for those
 asset formats, `sendmail` (any MTA) for mail.
@@ -447,7 +462,9 @@ OnCalendar=Mon 03:00
 
 ## Uninstall
 
-Paths below are the defaults; use your `PREFIX` if you changed it.
+An RPM install: disable the `relrotate@*.timer` units as in the first
+lines below, then `dnf remove relrotate`. For `install.sh`:
+paths below are the defaults; use your `PREFIX` if you changed it.
 Add `rm -rf /var/lib/relrotate /etc/relrotate` to drop the state and your
 recipes too; installed apps and their release directories stay as they are.
 
