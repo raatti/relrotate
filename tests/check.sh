@@ -24,7 +24,9 @@ echo "== relrotate.spec"
 v="$(sed -n 's/^RELROTATE_VERSION="\(.*\)"$/\1/p' relrotate)"
 grep -qx "Version:  *$v" relrotate.spec \
     || { echo "relrotate.spec: Version is not $v (RELROTATE_VERSION)" >&2; exit 1; }
-if command -v rpmbuild >/dev/null && command -v git >/dev/null && git rev-parse --git-dir >/dev/null 2>&1; then
+# rpmbuild alone is not enough: Ubuntu has it with an empty RPM database, so
+# the spec's BuildRequires can never be met there.
+if rpm -q rpm-build systemd-rpm-macros >/dev/null 2>&1 && command -v git >/dev/null && git rev-parse --git-dir >/dev/null 2>&1; then
     # The same build as .github/workflows/release.yml, from the working tree.
     rpmtmp="$(mktemp -d)"
     trap 'rm -rf "$rpmtmp"' EXIT
@@ -39,7 +41,7 @@ if command -v rpmbuild >/dev/null && command -v git >/dev/null && git rev-parse 
     done
     echo "built relrotate-$v-1.noarch.rpm"
 else
-    echo "rpmbuild or git not found: RPM build not checked"
+    echo "not an RPM build host (rpm-build, systemd-rpm-macros, git): RPM build not checked"
 fi
 
 [[ "${1:-}" != lint ]] || exit 0

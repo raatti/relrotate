@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `tests/check.sh` builds the RPM only on an RPM build host; it failed on
+  Ubuntu, which has `rpmbuild` but none of the build packages (#113).
+
 ## 0.4.1 (2026-11-21)
 
 - Releases carry `relrotate-X.Y.Z-1.noarch.rpm` for RHEL 9/10, their clones
