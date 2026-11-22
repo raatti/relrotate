@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.2 (2026-11-21)
+
+- Every command exited 1 without a message on a host with no MTA
+  (`/usr/sbin/sendmail`, `/usr/lib/sendmail`); the lookup can no longer end
+  the run (#117).
+- relrotate can update itself. `relrotate setup` asks, default no; on yes it
+  writes `apps.d/relrotate.conf` from the shipped example for an `install.sh`
+  or an RPM install and enables `relrotate@relrotate.timer`. Releases are
+  installed only with a good signature on `SHA256SUMS` (#115).
+- `install.sh` keeps the installed tree in `PREFIX/lib/relrotate-releases/`
+  with the symlink `PREFIX/lib/relrotate-current`, and installs the signing
+  keyring to `PREFIX/share/relrotate/` (#115, #116). New: `STATEDIR`, and
+  `ALLOW_NONROOT=yes` for a staged install.
+- The release RPM is signed and `SHA256SUMS` has a detached signature,
+  `SHA256SUMS.asc`; the public key is `RPM-GPG-KEY-relrotate` in the
+  repository (#116).
+- `tests/check.sh` builds the RPM only on an RPM build host; it failed on
+  Ubuntu, which has `rpmbuild` but none of the build packages (#113).
+- No shipped recipe sets `MIN_AGE_DAYS`: the npmplus example had 3, and so
+  had the self-update recipes before release. Updates install at once
+  unless you set it (#123).
+
 ## 0.4.1 (2026-11-21)
 
 - Releases carry `relrotate-X.Y.Z-1.noarch.rpm` for RHEL 9/10, their clones

@@ -1,7 +1,7 @@
 # Lint on every pull request and push to main; the tests once per release.
 # Lint runs in the shared job image (git.raatti.net/infra/ci, repository
-# infra/forgejo-runners), which holds shellcheck; the tests job installs the
-# tools its runner image lacks. The checks themselves live in tests/check.sh.
+# infra/forgejo-runners), which holds shellcheck and every tool the tests
+# need; neither job installs anything. The checks live in tests/check.sh.
 # actions/checkout v7.0.1 is the same commit on code.forgejo.org and
 # github.com, whichever the instance's DEFAULT_ACTIONS_URL points at.
 name: checks
@@ -32,18 +32,11 @@ jobs:
     if: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    container:
+      image: git.raatti.net/infra/ci:almalinux-10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install the tools the runner lacks
-        run: |
-          for t in shellcheck jq curl bzip2 xz unzip zip; do
-            command -v "$t" >/dev/null && continue
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends \
-              shellcheck jq curl bzip2 xz-utils unzip zip
-            break
-          done
       - name: Lint and test
         run: tests/check.sh

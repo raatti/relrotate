@@ -88,16 +88,60 @@ Or, on RHEL 9/10, their clones and Fedora, the RPM from the
 [release page](https://github.com/raatti/relrotate/releases) (from 0.4.1 on):
 
 ```bash
+sudo rpm --import https://raw.githubusercontent.com/raatti/relrotate/main/RPM-GPG-KEY-relrotate
+rpm -K ./relrotate-X.Y.Z-1.noarch.rpm     # must say: digests signatures OK
 sudo dnf install ./relrotate-X.Y.Z-1.noarch.rpm
 ```
 
-The RPM is unsigned: check it against `SHA256SUMS` from the same release.
+`dnf` does not check the signature of a local file by default, so run the
+`rpm -K` line. From 0.4.2 on the RPM is signed, and so is `SHA256SUMS`
+(`SHA256SUMS.asc`), which also lists the tarball. The key is
+`RPM-GPG-KEY-relrotate` in this repository, fingerprint
+`4EBA 8E3A DBB7 F14E CAD7  54A2 829A F617 0A43 D845`; compare it with what
+`gpg --show-keys RPM-GPG-KEY-relrotate` prints before you import the file.
+The 0.4.1 RPM is unsigned: check it against `SHA256SUMS` from its release.
+To check a download by hand:
+
+```bash
+gpg --import RPM-GPG-KEY-relrotate
+gpg --verify SHA256SUMS.asc SHA256SUMS && sha256sum -c --ignore-missing SHA256SUMS
+```
+
 It installs under `/usr` where `install.sh` uses `/usr/local`; recipes,
 `relrotate.conf` and state are in the same places. Use one or the other:
 an `install.sh` copy wins over the RPM (units in `/etc/systemd/system`,
 `/usr/local/sbin` first in root's `PATH`), so remove it first (see
 Uninstall, without the `rm -rf` of state and recipes). `relrotate setup`
 is not run by the RPM.
+
+### relrotate updates itself
+
+`relrotate setup` asks "Update relrotate itself automatically from its
+GitHub releases?" (default no). On yes it writes
+`/etc/relrotate/apps.d/relrotate.conf` from the shipped example for your
+kind of install and turns on `relrotate@relrotate.timer`. From then on
+relrotate is one more app: `status`, `check`, `hold`, `rollback` and the
+notifications work as for any other. Needs `gpgv` (package `gnupg2`).
+
+- **What is trusted:** a release is installed only when `SHA256SUMS` carries
+  a good signature from the key above and lists the file's hash. The
+  keyring is `relrotate-keyring.gpg`, installed next to the examples.
+- **Which releases:** `POLICY="minor"`, which for 0.x means patch releases
+  only, installed as soon as the timer sees them. To let a release settle
+  first, set `MIN_AGE_DAYS` in the recipe.
+- **`install.sh` install** (0.4.2 or newer): `install.sh` keeps the tree it
+  installed in `PREFIX/lib/relrotate-releases/<version>`, with
+  `PREFIX/lib/relrotate-current` pointing at the live one. An update unpacks
+  the new release there and runs its `install.sh`; a rollback runs the old
+  one again.
+- **RPM install:** the release RPM is installed with `dnf`. relrotate keeps
+  each RPM it installed, so a rollback has the previous one; the version you
+  installed by hand before the first update is not kept, so that first
+  update cannot be rolled back automatically.
+- **Unit files:** every update installs the shipped `relrotate@.service` and
+  `relrotate-digest.service` again. Keep local changes in drop-ins
+  (`systemctl edit`), not in the files.
+- **Off again:** `relrotate disable relrotate`, and remove the recipe.
 
 Needs bash 5.1 or newer (the bash of RHEL 9), `curl`, `jq`, `coreutils` (incl. `timeout`), `tar`, `util-linux` (flock, runuser);
 optional: `gpgv` for signature checks, `unzip`/`xz`/`bzip2` for those
@@ -188,7 +232,8 @@ relrotate enable <app>         turn on the app's timer: systemctl enable --now
                                relrotate@<app>.timer
 relrotate disable <app>        turn the timer off
 relrotate setup                ask where notifications go (mail, discord,
-                               ntfy, webhook) when none are set; install.sh
+                               ntfy, webhook) when none are set, and whether
+                               relrotate should update itself; install.sh
                                runs it on a terminal
 relrotate status [app]         one line per app; --json for scripts
 relrotate doctor [app]         check recipes, the newest release's assets,
@@ -338,6 +383,7 @@ In `examples/apps.d/`, each checked against the project's real releases:
 
 | Recipe | Layout | Shows |
 |---|---|---|
+| relrotate, relrotate-rpm | symlink, binary | relrotate itself (written by `relrotate setup`): signed checksum file, hooks that run an installer |
 | headscale | binary | API digest + checksums.txt, SQLite backup hook, rkhunter |
 | forgejo | binary | Gitea/Forgejo API (Codeberg), sha256 sidecar |
 | forgejo-runner | binary | code.forgejo.org behind Anubis |
@@ -365,7 +411,8 @@ Paths, ports and hostnames in them are examples; adjust to your host.
 ## Notifications
 
 `relrotate setup` asks for a mail address and one chat destination and
-writes them for you, as long as none are set; `install.sh` runs it when it
+writes them for you, as long as none are set (it then asks about
+self-update, see Install); `install.sh` runs it when it
 is on a terminal. By hand:
 
 Each event goes to `MAIL_TO` and to every `NOTIFY` destination in
@@ -476,7 +523,8 @@ recipes too; installed apps and their release directories stay as they are.
   rm -f /etc/systemd/system/relrotate@.service /etc/systemd/system/relrotate@.timer \
         /etc/systemd/system/relrotate-digest.service /etc/systemd/system/relrotate-digest.timer
   rm -f /usr/local/sbin/relrotate
-  rm -rf /usr/local/lib/relrotate /usr/local/share/relrotate
+  rm -rf /usr/local/lib/relrotate /usr/local/lib/relrotate-releases /usr/local/share/relrotate
+  rm -f /usr/local/lib/relrotate-current
   systemctl daemon-reload )
 ```
 

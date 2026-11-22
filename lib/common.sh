@@ -61,7 +61,9 @@ load_global_conf() {
     if [[ -z "$SENDMAIL" ]]; then
         local s
         for s in /usr/sbin/sendmail /usr/lib/sendmail; do
-            [[ -x "$s" ]] && { SENDMAIL="$s"; break; }
+            # if, not &&: as the function's last command a false test would
+            # end the run (set -e) on a host with no MTA.
+            if [[ -x "$s" ]]; then SENDMAIL="$s"; break; fi
         done
     fi
 }

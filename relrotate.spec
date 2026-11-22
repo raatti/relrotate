@@ -2,7 +2,7 @@
 #   rpmbuild -ta relrotate-X.Y.Z.tar.gz
 # Version must equal RELROTATE_VERSION in ./relrotate (tests/check.sh checks).
 Name:           relrotate
-Version:        0.4.1
+Version:        0.4.2
 Release:        1%{?dist}
 Summary:        Policy-driven application updates with rollback
 License:        MIT
@@ -38,6 +38,7 @@ install -d -m 0755 %{buildroot}%{_prefix}/lib/relrotate
 install -p -m 0644 lib/*.sh %{buildroot}%{_prefix}/lib/relrotate/
 install -d -m 0755 %{buildroot}%{_datadir}/relrotate/examples
 cp -r examples/. %{buildroot}%{_datadir}/relrotate/examples/
+install -p -m 0644 relrotate-keyring.gpg %{buildroot}%{_datadir}/relrotate/relrotate-keyring.gpg
 install -d -m 0750 %{buildroot}%{_sysconfdir}/relrotate/apps.d \
     %{buildroot}%{_sysconfdir}/relrotate/keys %{buildroot}%{_sharedstatedir}/relrotate
 install -p -m 0640 etc/relrotate.conf %{buildroot}%{_sysconfdir}/relrotate/relrotate.conf

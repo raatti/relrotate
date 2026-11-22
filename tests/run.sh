@@ -1031,6 +1031,11 @@ rm -f "$T/etc/apps.d/badlayout.conf"
 check "path-like app name rejected (got $rc)" test "$rc" = 2
 check "status lists apps" bash -c "'$RR' status | grep -q '^web '"
 
+# Fails without the fix only where neither /usr/sbin/sendmail nor
+# /usr/lib/sendmail exists (CI runners; not a host with an MTA).
+check "relrotate runs when it has to look for sendmail itself (no MTA: still exit 0)" \
+    bash -c "env -u RELROTATE_SENDMAIL '$RR' list >/dev/null"
+
 echo "== install layout: PREFIX/sbin and PREFIX/lib/relrotate"
 rm -rf "$T/pfx"; mkdir -p "$T/pfx/sbin" "$T/pfx/lib/relrotate"
 cp "$RR" "$T/pfx/sbin/relrotate"; cp "$here"/../lib/*.sh "$T/pfx/lib/relrotate/"
@@ -2423,6 +2428,79 @@ jq '[{tag_name: "v9.9.9.9", draft: false, prerelease: false, assets: []}] + .' "
 check "without VERSION_REGEX a four-part tag is still not a version" \
     bash -c "out=\$(STUB_RELEASES='$T/releases-4.json' '$RR' check web 2>/dev/null) && grep -q '^newest' <<<\"\$out\" && ! grep -q '9\.9\.9\.9' <<<\"\$out\""
 rm -f "$T/etc/apps.d/dt.conf" "$T/quadlet/dt.container" "$T"/releases-dt*.json "$T/releases-4.json"; rm -rf "$T/state/dt"
+
+echo "== relrotate updates itself"
+# install.sh runs for real into scratch directories, and the installed copy
+# then updates itself from fake releases. gpgv is a stub here; the signature
+# check itself is covered by "signed checksum file" above and, with the real
+# key, by .github/release-rpm.sh at release time.
+P="$T/self"; mkdir -p "$P/units" "$P/assets"
+self_env=(PREFIX="$P/pfx" ETC="$P/etc" UNITDIR="$P/units" STATEDIR="$P/state" ALLOW_NONROOT=yes
+          RELROTATE_CONF_DIR="$P/etc" RELROTATE_STATE_DIR="$P/state")
+selfinst() { env "${self_env[@]}" "$1/install.sh" </dev/null >/dev/null 2>&1; }
+selfrr() { env -u RELROTATE_LIB_DIR -u RELROTATE_EXAMPLES_DIR "${self_env[@]}" "$P/pfx/sbin/relrotate" "$@"; }
+selfver() { selfrr --version | awk '{print $2}'; }
+cur="$("$RR" --version | awk '{print $2}')"; new="${cur%.*}.99"; broken="${cur%.*}.100"
+printf '#!/usr/bin/env bash\necho "gpgv $*" >> "%s/log/gpgv"\n[[ ! -e "%s/gpg-bad" ]]\n' "$T" "$T" > "$T/bin/gpgv"; chmod +x "$T/bin/gpgv"
+# mkrel VERSION [broken]: a release of this tree under another version number;
+# broken: its install.sh stops after it has replaced the relrotate script.
+mkrel() {
+    local v="$1" d="$P/build/relrotate-$1"
+    mkdir -p "$d"
+    cp -r "$here/../relrotate" "$here/../install.sh" "$here/../lib" "$here/../etc" "$here/../systemd" \
+        "$here/../examples" "$here/../relrotate-keyring.gpg" "$d/"
+    sed -i "s/^RELROTATE_VERSION=.*/RELROTATE_VERSION=\"$v\"/" "$d/relrotate"
+    # shellcheck disable=SC2016  # a literal $src in the sed pattern
+    [[ -z "${2:-}" ]] || sed -i '/^install -m 0755 "\$src\/relrotate"/a exit 1' "$d/install.sh"
+    tar -czf "$P/assets/relrotate-$v.tar.gz" -C "$P/build" "relrotate-$v"
+    ( cd "$P/assets" && sha256sum "relrotate-$v.tar.gz" > "SHA256SUMS-$v" )
+    echo sig > "$P/assets/SHA256SUMS.asc"
+    jq -n --arg d "file://$P/assets" --arg v "$v" '[{tag_name: ("v" + $v), draft: false, prerelease: false,
+        published_at: "2020-01-01T00:00:00Z", assets: [
+          {name: ("relrotate-" + $v + ".tar.gz"), browser_download_url: ($d + "/relrotate-" + $v + ".tar.gz")},
+          {name: "SHA256SUMS", browser_download_url: ($d + "/SHA256SUMS-" + $v)},
+          {name: "SHA256SUMS.asc", browser_download_url: ($d + "/SHA256SUMS.asc")}]}]' > "$P/rel-$v.json"
+}
+mkrel "$new"; mkrel "$broken" broken
+check "the broken test release really has a failing install.sh" grep -qx 'exit 1' "$P/build/relrotate-$broken/install.sh"
+
+check "install.sh installs into a PREFIX" selfinst "$here/.."
+check "  the installed copy runs" test "$(selfver)" = "$cur"
+check "  the installed tree is kept as a release, the symlink points at it" \
+    test "$(readlink "$P/pfx/lib/relrotate-current")" = "$P/pfx/lib/relrotate-releases/$cur" -a -x "$P/pfx/lib/relrotate-current/install.sh"
+check "  the signing keyring is installed" cmp -s "$here/../relrotate-keyring.gpg" "$P/pfx/share/relrotate/relrotate-keyring.gpg"
+touch "$P/pfx/lib/relrotate-releases/$cur/marker"   # a re-copy of the tree would lose it
+check "install.sh run again from that release directory leaves it in place" \
+    bash -c "$(declare -f selfinst); $(declare -p self_env); selfinst '$P/pfx/lib/relrotate-current' && test -e '$P/pfx/lib/relrotate-releases/$cur/marker'"
+
+reset_logs
+check "setup from a checkout does not offer self-update" bash -c "'$RR' setup </dev/null | grep -q 'self-update is not offered'"
+check "setup answered no writes no recipe" bash -c "$(declare -f selfrr); $(declare -p self_env); P='$P'; printf 'n\nn\nn\n' | selfrr setup >/dev/null && test ! -e '$P/etc/apps.d/relrotate.conf'"
+check "setup answered yes writes the recipe" bash -c "$(declare -f selfrr); $(declare -p self_env); P='$P'; printf 'n\nn\ny\n' | selfrr setup >/dev/null 2>&1"
+check "  with this PREFIX in place of /usr/local" bash -c "grep -qx 'TARGET=$P/pfx/lib/relrotate-current' '$P/etc/apps.d/relrotate.conf' && ! grep -q /usr/local '$P/etc/apps.d/relrotate.conf'"
+check "  not readable by others" test "$(stat -c %a "$P/etc/apps.d/relrotate.conf")" = 640
+check "  and enables the timer" grep -q 'enable --now relrotate@relrotate.timer' "$T/log/systemctl"
+check "setup again says self-update is on and asks nothing" bash -c "$(declare -f selfrr); $(declare -p self_env); P='$P'; selfrr setup </dev/null | grep -q 'relrotate updates itself'"
+check "check reads the installed version from the symlink" bash -c "$(declare -f selfrr); $(declare -p self_env); P='$P'; STUB_RELEASES='$P/rel-$new.json' selfrr check relrotate 2>/dev/null | grep -q '^installed *$cur\$'"
+
+touch "$T/gpg-bad"
+check "a release with a bad signature is not installed" bash -c "$(declare -f selfrr selfver); $(declare -p self_env); P='$P'; ! STUB_RELEASES='$P/rel-$new.json' selfrr update relrotate 2>'$P/bad.err' && test \"\$(selfver)\" = '$cur'"
+check "  and the reason is the signature" grep -q 'gpg signature check failed' "$P/bad.err"
+rm -f "$T/gpg-bad"; reset_logs
+check "relrotate updates itself (exit 0)" bash -c "$(declare -f selfrr); $(declare -p self_env); P='$P'; STUB_RELEASES='$P/rel-$new.json' selfrr update relrotate 2>/dev/null"
+check "  SHA256SUMS was checked against the shipped keyring" grep -qE "^gpgv --keyring $P/pfx/share/relrotate/relrotate-keyring.gpg [^ ]+/SHA256SUMS.asc [^ ]+/SHA256SUMS$" "$T/log/gpgv"
+check "  the installed copy is the new version" test "$(selfver)" = "$new"
+check "  symlink and state say so" test "$(readlink "$P/pfx/lib/relrotate-current")" = "$P/pfx/lib/relrotate-releases/$new" -a "$(cat "$P/state/relrotate/installed")" = "$new"
+check "  the old release is kept for a rollback" test -x "$P/pfx/lib/relrotate-releases/$cur/install.sh"
+check "rollback reinstalls the old version" bash -c "$(declare -f selfrr selfver); $(declare -p self_env); P='$P'; selfrr rollback relrotate 2>/dev/null && test \"\$(selfver)\" = '$cur'"
+check "  symlink is back" test "$(readlink "$P/pfx/lib/relrotate-current")" = "$P/pfx/lib/relrotate-releases/$cur"
+check "a release whose install.sh fails half-way fails the update" bash -c "$(declare -f selfrr); $(declare -p self_env); P='$P'; ! STUB_RELEASES='$P/rel-$broken.json' selfrr update relrotate 2>/dev/null"
+check "  and the old version is installed again" test "$(selfver)" = "$cur" -a "$(cat "$P/state/relrotate/installed")" = "$cur"
+
+# An RPM install: rpm says it owns the script, so setup takes the RPM recipe.
+printf '#!/bin/sh\nexit 0\n' > "$T/bin/rpm"; chmod +x "$T/bin/rpm"
+check "setup on an RPM install writes the RPM recipe" bash -c "printf 'y\n' | env -u RELROTATE_EXAMPLES_DIR '$RR' setup >/dev/null 2>&1 && cmp -s '$here/../examples/apps.d/relrotate-rpm.conf' '$T/etc/apps.d/relrotate.conf'"
+rm -f "$T/bin/rpm" "$T/bin/gpgv" "$T/etc/apps.d/relrotate.conf"; rm -rf "$P" "$T/state/relrotate"
 
 echo
 echo "passed: $pass  failed: $fail"

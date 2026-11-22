@@ -32,7 +32,7 @@
 set -Eeuo pipefail
 shopt -s nullglob
 
-RELROTATE_VERSION="0.4.1"
+RELROTATE_VERSION="0.4.2"
 
 # Locations (overridable for tests and non-standard installs)
 LIB_DIR="${RELROTATE_LIB_DIR:-}"
@@ -276,6 +276,38 @@ conf_set() { file_set "$CONF_DIR/relrotate.conf" "$1" "$2"; }
 # setup: ask where notifications go, when nothing is set yet. Answers come
 # from stdin (install.sh runs this on a terminal); end of input means no.
 cmd_setup() {
+    setup_notifications
+    setup_self_update
+    echo "check with: relrotate doctor"
+}
+
+# Offer to keep relrotate itself up to date: the shipped recipe for this
+# kind of install, as apps.d/relrotate.conf, and its timer.
+setup_self_update() {
+    local recipe="$CONF_DIR/apps.d/relrotate.conf" self prefix ex a
+    if [[ -e "$recipe" ]]; then echo "relrotate updates itself: $recipe"; return 0; fi
+    self="$(readlink -f "${BASH_SOURCE[0]}")"
+    prefix="$(dirname "$(dirname "$self")")"
+    if command -v rpm >/dev/null 2>&1 && rpm -qf "$self" >/dev/null 2>&1; then
+        ex="$EXAMPLES_DIR/relrotate-rpm.conf"
+    elif [[ -L "$prefix/lib/relrotate-current" && "$prefix" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+        ex="$EXAMPLES_DIR/relrotate.conf"   # install.sh, 0.4.2 or newer
+    else
+        echo "self-update is not offered: it needs an RPM install, or install.sh of 0.4.2 or newer"
+        return 0
+    fi
+    if [[ -z "$EXAMPLES_DIR" || ! -r "$ex" ]]; then
+        echo "self-update is not offered: the example recipe ${ex##*/} is missing"; return 0
+    fi
+    read -r -p "Update relrotate itself automatically from its GitHub releases? [y/N] " a || a=""
+    [[ "$a" == [yY]* ]] || return 0
+    # The example names /usr/local; an install.sh PREFIX goes in its place.
+    ( umask 027; sed "s|/usr/local|$prefix|g" "$ex" > "$recipe" ) || die 1 "cannot write $recipe"
+    echo "wrote $recipe"
+    cmd_timer enable relrotate
+}
+
+setup_notifications() {
     local conf="$CONF_DIR/relrotate.conf" a kind url f
     if [[ -n "$MAIL_TO" ]] || (( ${#NOTIFY[@]} )); then
         echo "notifications are already set; edit $conf to change them"; return 0
@@ -307,7 +339,6 @@ cmd_setup() {
         conf_set NOTIFY "($kind:$f)" || die 1 "cannot write $conf"
         echo "$kind notifications use $f"
     fi
-    echo "check with: relrotate doctor"
 }
 
 # One app's state as JSON; the text status is printed from it.
