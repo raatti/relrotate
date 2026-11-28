@@ -2,7 +2,7 @@
 #   rpmbuild -ta relrotate-X.Y.Z.tar.gz
 # Version must equal RELROTATE_VERSION in ./relrotate (tests/check.sh checks).
 Name:           relrotate
-Version:        0.4.2
+Version:        0.4.3
 Release:        1%{?dist}
 Summary:        Policy-driven application updates with rollback
 License:        MIT

@@ -54,10 +54,29 @@ for t in sudo su dnf yum apt-get npm pip wget ssh nc systemctl podman runuser cu
 done
 [[ "$HOME" == "$T/home" ]] || { echo "tests/run.sh: refusing to start: HOME is not the fake home" >&2; exit 2; }
 
-pass=0 fail=0
+pass=0 fail=0 failed=() timings=() SECTION="" SECTION_T0=""
 ok()   { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
-bad()  { fail=$((fail+1)); printf '  FAIL %s\n' "$1"; }
-check() { local d="$1"; shift; if "$@"; then ok "$d"; else bad "$d"; fi; }
+bad()  { fail=$((fail+1)); failed+=("${SECTION:+$SECTION: }$1"); printf '  FAIL %s\n' "$1"; }
+# On FAIL the command is printed too (cut at 300 characters): many checks
+# share a description, the command says which one it was.
+check() {
+    local d="$1" c; shift
+    if "$@"; then ok "$d"; else
+        bad "$d"; c="$*"; (( ${#c} <= 300 )) || c="${c:0:300}..."
+        printf '       %s\n' "$c"
+    fi
+}
+# section NAME: start a section; the previous one's time is recorded.
+usec() { local t="$EPOCHREALTIME"; echo "${t/./}"; }
+section_end() {
+    [[ -n "$SECTION" ]] || return 0
+    local ms=$(( ($(usec) - SECTION_T0) / 1000 ))
+    timings+=("$(printf '%6d.%01ds  %s' $((ms / 1000)) $((ms % 1000 / 100)) "$SECTION")")
+}
+section() { section_end; SECTION="$1"; SECTION_T0="$(usec)"; echo "== $1"; }
+# A setup command that fails ends the run (set -e); say where. Only the
+# top-level shell: a failure inside $(...) does not end the run by itself.
+trap '(( BASH_SUBSHELL )) || echo "tests/run.sh: a setup command failed at line $LINENO (section: ${SECTION:-none})" >&2' ERR
 
 # ----------------------------------------------------------------- stubs ---
 mkdir -p "$T/log"
@@ -175,7 +194,7 @@ cat > "$T/bin/sendmail" <<EOF
 cat >> "$T/log/mail"; echo "----" >> "$T/log/mail"
 EOF
 chmod +x "$T/bin/"*
-echo "== test harness"
+section "test harness"
 echo '[]' > "$T/releases.json"
 check "curl wrapper fetches a file:// URL" "$T/bin/curl" -fs -o /dev/null "file://$T/releases.json"
 check "curl wrapper refuses a non-file URL from --config (protocol disabled, rc 1)" bash -c "printf 'url = \"http://127.0.0.1:9/\"\\n' | '$T/bin/curl' -fs --fail-early -o /dev/null -o /dev/null --config - 'file://$T/releases.json' 2>/dev/null; test \$? = 1"
@@ -234,6 +253,9 @@ releases_json() {
     echo "$out]"
 }
 releases_json > "$T/releases.json"
+# The same list with a wrong API digest for 1.3.0's tarball.
+jq '(.[] | select(.tag_name=="v1.3.0") | .assets[0].digest) = "sha256:'"$(printf '0%.0s' {1..64})"'"' \
+    "$T/releases.json" > "$T/releases-bad.json"
 
 reset_logs() { rm -f "$T/log/"* "$T/healthz" "$T/unhealthy" "$T/fail-pull" "$T/fail-reload" "$T/fail-reload-once" "$T/fail-restart" "$T/fail-notify" "$T/fail-notify-url" "$T/no-digest" "$T/image-gone" "$T"/pulled-* "$T/fail-dump" "$T/empty-dump" "$T/fail-tag"; }
 
@@ -260,20 +282,20 @@ web_install_old() {
     ln -s "$T/www/demo-releases/1.2.3" "$T/www/demo"
 }
 
-echo "== policy selection"
+section "policy selection"
 web_install_old
 for p in patch:1.2.4 minor:1.3.0 major:2.0.0; do
     web_recipe "${p%%:*}" api-digest
-    got="$("$RR" check web 2>/dev/null | awk '$1=="candidate"{print $2}')"
+    out="$("$RR" check web 2>/dev/null)" || true
+    got="$(awk '$1=="candidate"{print $2}' <<<"$out")"
     check "POLICY=${p%%:*} picks ${p#*:} (got $got)" test "$got" = "${p#*:}"
 done
+# $out is the major run's: the installed and newest lines do not depend on POLICY.
+check "installed version read from symlink" grep -q 'installed *1.2.3' <<<"$out"
+check "draft v9.9.9 ignored (newest is 2.0.0)" grep -q 'newest *2.0.0' <<<"$out"
 web_recipe minor api-digest
-check "installed version read from symlink" \
-    bash -c "'$RR' check web 2>/dev/null | grep -q 'installed *1.2.3'"
-check "draft v9.9.9 ignored (newest is 2.0.0)" \
-    bash -c "'$RR' check web 2>/dev/null | grep -q 'newest *2.0.0'"
 
-echo "== check changes nothing"
+section "check changes nothing"
 web_install_old; web_recipe minor api-digest
 mkdir -p "$T/state/web"; echo 1.2.4 > "$T/state/web/skip"
 "$RR" check web >/dev/null 2>&1
@@ -281,7 +303,7 @@ check "check keeps the skip marker" test -s "$T/state/web/skip"
 check "update past a skipped version" "$RR" update web
 check "update clears the skip marker" test ! -e "$T/state/web/skip"
 
-echo "== symlink update, two verify methods"
+section "symlink update, two verify methods"
 reset_logs; web_install_old; web_recipe minor "api-digest sha256-sidecar"
 check "update exits 0" "$RR" update web
 check "symlink points at 1.3.0" test "$(readlink "$T/www/demo")" = "$T/www/demo-releases/1.3.0"
@@ -294,18 +316,16 @@ check "mail: 2.0.0 out of policy" grep -q '2.0.0 available' "$T/log/mail"
 check "second run is a no-op" "$RR" update web
 check "out-of-policy mail sent only once" test "$(grep -c '2.0.0 available' "$T/log/mail")" = 1
 
-echo "== dry run changes nothing"
+section "dry run changes nothing"
 reset_logs; web_install_old; web_recipe minor api-digest
 check "dry run exits 0" "$RR" update -n web
 check "dry run: symlink unchanged" test "$(readlink "$T/www/demo")" = "$T/www/demo-releases/1.2.3"
 check "dry run: no state written" bash -c "[[ -z \$(ls '$T/state/web' | grep -v lock) ]]"
 check "dry run: no mail (not even out-of-policy)" test ! -e "$T/log/mail"
-jq '(.[] | select(.tag_name=="v1.3.0") | .assets[0].digest) = "sha256:'"$(printf '0%.0s' {1..64})"'"' \
-    "$T/releases.json" > "$T/releases-bad.json"
 check "dry run with a bad download fails" bash -c "! STUB_RELEASES='$T/releases-bad.json' '$RR' update -n web 2>/dev/null"
 check "dry run failure: no state, no mail" bash -c "[[ -z \$(ls '$T/state/web' | grep -v lock) && ! -e '$T/log/mail' ]]"
 
-echo "== HEALTH_URL"
+section "HEALTH_URL"
 reset_logs; web_install_old; web_recipe minor api-digest
 echo "HEALTH_URL=file://$T/healthz" >> "$T/etc/apps.d/web.conf"
 check "HEALTH_URL missing: update rolls back" bash -c "! '$RR' update web 2>/dev/null"
@@ -315,17 +335,15 @@ check "HEALTH_URL answers: update exits 0" "$RR" update web
 check "HEALTH_URL was asked" grep -q "file://$T/healthz" "$T/log/curl"
 rm -f "$T/healthz"
 
-echo "== digest mismatch"
+section "digest mismatch"
 reset_logs; web_install_old; web_recipe minor api-digest
-jq '(.[] | select(.tag_name=="v1.3.0") | .assets[0].digest) = "sha256:'"$(printf '0%.0s' {1..64})"'"' \
-    "$T/releases.json" > "$T/releases-bad.json"
 check "update fails" bash -c "! STUB_RELEASES='$T/releases-bad.json' '$RR' update web 2>/dev/null"
 check "symlink unchanged" test "$(readlink "$T/www/demo")" = "$T/www/demo-releases/1.2.3"
 check "no installed state written" test ! -e "$T/state/web/installed"
 check "no release dir staged" test ! -e "$T/www/demo-releases/1.3.0"
 check "mail: failed before install" grep -q 'failed before install' "$T/log/mail"
 
-echo "== health check fails -> rollback"
+section "health check fails -> rollback"
 reset_logs; web_install_old; web_recipe minor api-digest
 touch "$T/unhealthy"
 # healthy again once we are back on the old version
@@ -337,7 +355,7 @@ check "symlink rolled back to 1.2.3" test "$(readlink "$T/www/demo")" = "$T/www/
 check "installed state not advanced" test ! -e "$T/state/web/installed"
 check "mail: rolled back" grep -q 'rolled back to 1.2.3' "$T/log/mail"
 
-echo "== every update step that fails is caught"
+section "every update step that fails is caught"
 for hook in post_extract pre_update; do
     reset_logs; web_install_old; web_recipe minor api-digest
     echo "$hook() { return 1; }" >> "$T/etc/apps.d/web.conf"
@@ -361,7 +379,7 @@ for step in post_flip restart; do
     check "$step failure: mail rolled back" grep -q 'rolled back to 1.2.3' "$T/log/mail"
 done
 
-echo "== failing on_rollback hook during an automatic rollback"
+section "failing on_rollback hook during an automatic rollback"
 reset_logs; web_install_old; web_recipe minor api-digest
 echo "post_flip() { return 1; }; on_rollback() { return 1; }" >> "$T/etc/apps.d/web.conf"
 check "update fails" bash -c "! '$RR' update web 2>/dev/null"
@@ -369,7 +387,7 @@ check "still restarted and back on 1.2.3" bash -c "grep -q 'restart demo.service
 check "last-result names the hook" grep -q 'on_rollback hook failed' "$T/state/web/last-result"
 check "mail names the hook" grep -q 'on_rollback hook failed' "$T/log/mail"
 
-echo "== candidate already live, state behind (after a failed rollback)"
+section "candidate already live, state behind (after a failed rollback)"
 # The new release is live while state still names the old one, so the next
 # run picks the live version again. Staging it would rm -rf the directory
 # the symlink serves.
@@ -387,7 +405,7 @@ check "state still 1.2.3" test "$(cat "$T/state/web/installed")" = 1.2.3
 check "last-result says refused" grep -q 'refused: 1.3.0 already live, state says 1.2.3' "$T/state/web/last-result"
 check "mail says adopt" grep -q 'relrotate adopt web 1.3.0' "$T/log/mail"
 
-echo "== manual rollback"
+section "manual rollback"
 web_on_new() {   # installed 1.3.0, previous 1.2.3, both release dirs present
     reset_logs; web_install_old; web_recipe minor api-digest
     mkdir -p "$T/www/demo-releases/1.3.0"; echo "demo 1.3.0" > "$T/www/demo-releases/1.3.0/VERSION"
@@ -399,6 +417,17 @@ check "rollback exits 0" "$RR" rollback web
 check "symlink on 1.2.3" test "$(readlink "$T/www/demo")" = "$T/www/demo-releases/1.2.3"
 check "state installed=1.2.3 previous=1.3.0 skip=1.3.0" bash -c "[[ \$(cat '$T/state/web/installed') == 1.2.3 && \$(cat '$T/state/web/previous') == 1.3.0 && \$(cat '$T/state/web/skip') == 1.3.0 ]]"
 check "no mail on success" test ! -s "$T/log/mail"
+check "unskip clears the skip and logs it" \
+    bash -c "'$RR' unskip web 2>&1 | grep -q 'event=unskipped version=1.3.0' && test ! -e '$T/state/web/skip'"
+check "  then update installs the version again" \
+    bash -c "'$RR' update web >/dev/null 2>&1 && test \"\$(readlink '$T/www/demo')\" = '$T/www/demo-releases/1.3.0'"
+check "unskip with nothing skipped says so (exit 0)" bash -c "'$RR' unskip web 2>/dev/null | grep -q 'nothing skipped'"
+web_on_new
+"$RR" rollback web > "$T/rb.out" 2>/dev/null || true
+check "the rollback message names unskip" grep -q 'relrotate unskip web clears that' "$T/rb.out"
+web_on_new
+check "rollback --no-skip goes back without a skip" \
+    bash -c "'$RR' rollback --no-skip web > '$T/rb.out' 2>/dev/null && test ! -e '$T/state/web/skip' && test \"\$(cat '$T/state/web/installed')\" = 1.2.3 && ! grep -q skipped '$T/rb.out'"
 
 web_on_new
 echo "on_rollback() { return 1; }" >> "$T/etc/apps.d/web.conf"
@@ -406,16 +435,8 @@ check "hook failure: rollback exits non-zero" bash -c "! '$RR' rollback web 2>/d
 check "hook failure: still restarted" grep -q 'restart demo.service' "$T/log/systemctl"
 check "hook failure: state records 1.2.3 as installed" test "$(cat "$T/state/web/installed")" = 1.2.3
 check "hook failure: last-result names the hook" grep -q 'on_rollback hook failed' "$T/state/web/last-result"
+check "hook failure: 'with problems', not UNHEALTHY" bash -c "grep -q 'with problems' '$T/state/web/last-result' && ! grep -q UNHEALTHY '$T/state/web/last-result' && test ! -e '$T/state/web/unhealthy'"
 check "hook failure: mail sent" grep -q 'manual rollback' "$T/log/mail"
-
-web_on_new
-touch "$T/unhealthy"
-check "unhealthy: rollback exits non-zero" bash -c "! '$RR' rollback web 2>/dev/null"
-check "unhealthy: state records 1.2.3 as installed" test "$(cat "$T/state/web/installed")" = 1.2.3
-check "unhealthy: 1.3.0 skipped" test "$(cat "$T/state/web/skip")" = 1.3.0
-check "unhealthy: last-result says UNHEALTHY" grep -q UNHEALTHY "$T/state/web/last-result"
-check "unhealthy: status shows it" bash -c "'$RR' status web | grep -q UNHEALTHY"
-check "unhealthy: mail sent" grep -q 'manual rollback' "$T/log/mail"
 
 web_on_new
 rm -rf "$T/www/demo-releases/1.2.3"
@@ -427,7 +448,7 @@ check "switch fails: no restart" bash -c "! grep -q restart '$T/log/systemctl' 2
 check "switch fails: mail sent" grep -q 'manual rollback' "$T/log/mail"
 rm -rf "$T/state/web"
 
-echo "== flip failure is caught"
+section "flip failure is caught"
 reset_logs; web_install_old; web_recipe minor api-digest
 # a directory where the temporary symlink must go makes ln -sfn fail
 mkdir -p "$T/www/demo.relrotate-new/blocker"
@@ -436,7 +457,7 @@ check "installed state not advanced" test ! -e "$T/state/web/installed"
 check "symlink still on 1.2.3" test "$(readlink "$T/www/demo")" = "$T/www/demo-releases/1.2.3"
 rm -rf "$T/www/demo.relrotate-new"
 
-echo "== unsafe archive"
+section "unsafe archive"
 reset_logs; web_install_old; web_recipe minor none
 mkdir -p "$T/evil"; echo x > "$T/evil/x"
 tar -czf "$T/assets/demo-1.3.0.tar.gz" -C "$T/evil" --transform 's|^|../../|' x 2>/dev/null
@@ -529,7 +550,7 @@ else echo "  (skipping zip test: zip/unzip missing)"; fi
 rm -f "$T"/assets/demo-1.3.0.{bin,zip}
 make_tarball 1.3.0; releases_json > "$T/releases.json"
 
-echo "== pruning keeps KEEP versions, prereleases included"
+section "pruning keeps KEEP versions, prereleases included"
 reset_logs; web_install_old; web_recipe minor none; echo KEEP=1 >> "$T/etc/apps.d/web.conf"
 mkdir -p "$T/www/demo-releases/1.1.0" "$T/www/demo-releases/1.2.3-bak"
 check "update with KEEP=1 exits 0" "$RR" update web
@@ -540,7 +561,7 @@ check "update with KEEP=1 and prereleases exits 0" "$RR" update web
 check "old prerelease dirs are pruned too" bash -c "test ! -e '$T/www/demo-releases/1.1.0-rc1' && test ! -e '$T/www/demo-releases/1.0.0-rc2' && test ! -e '$T/www/demo-releases/1.1.0'"
 check "current and previous are kept" bash -c "test -d '$T/www/demo-releases/1.3.0' && test -d '$T/www/demo-releases/1.2.3'"
 
-echo "== binary layout"
+section "binary layout"
 reset_logs; rm -rf "$T/state/bin"
 mkdir -p "$T/usr/bin"
 cp "$T/assets/demobin_1.2.3_linux_amd64" "$T/usr/bin/demobin"
@@ -566,7 +587,7 @@ check "binary back to 1.2.3" test "$("$T/usr/bin/demobin")" = "demobin 1.2.3"
 check "1.2.4 marked as skipped" test "$(cat "$T/state/bin/skip")" = 1.2.4
 check "next update skips 1.2.4" bash -c "'$RR' update bin 2>&1 | grep -q 'event=up-to-date'"
 
-echo "== binary flip failure is caught"
+section "binary flip failure is caught"
 reset_logs; rm -rf "$T/state/bin"
 cp "$T/assets/demobin_1.2.3_linux_amd64" "$T/usr/bin/demobin"
 mkdir -p "$T/usr/bin/demobin.relrotate-new/blocker"
@@ -577,7 +598,7 @@ check "service not restarted" bash -c "! grep -q restart '$T/log/systemctl'"
 rm -rf "$T/usr/bin/demobin.relrotate-new"
 fi
 
-echo "== container layout"
+section "container layout"
 reset_logs; rm -rf "$T/state/ctr"
 mkdir -p "$T/quadlet"
 printf '[Container]\nImage=ghcr.io/example/demo:v1.2.3\nPublishPort=8080:8080\n' > "$T/quadlet/demo.container"
@@ -609,7 +630,7 @@ touch "$T/unhealthy"
 check "unhealthy container update fails" bash -c "! '$RR' update ctr 2>/dev/null"
 check "quadlet restored to v1.2.3" grep -q '^Image=ghcr.io/example/demo:v1.2.3$' "$T/quadlet/demo.container"
 
-echo "== container flip failure is caught"
+section "container flip failure is caught"
 reset_logs; rm -rf "$T/state/ctr"
 printf '[Container]\nImage=ghcr.io/example/demo:v1.2.3\n' > "$T/quadlet/demo.container"
 touch "$T/fail-reload-once"
@@ -627,7 +648,7 @@ check "update fails when daemon-reload keeps failing" bash -c "! '$RR' update ct
 check "mail does not claim nothing changed" bash -c "! grep -q 'failed before install' '$T/log/mail'"
 check "mail: rollback incomplete" grep -q 'ROLLBACK INCOMPLETE' "$T/log/mail"
 
-echo "== bz2 single-file binary"
+section "bz2 single-file binary"
 reset_logs; rm -rf "$T/state/bz"
 cp "$T/assets/demobin_1.2.3_linux_amd64" "$T/usr/bin/demobz"
 cat > "$T/etc/apps.d/bz.conf" <<EOF
@@ -649,7 +670,7 @@ check "binary unpacked from .bz2 is 1.3.0" test "$("$T/usr/bin/demobz")" = "demo
 check "binary is executable" test -x "$T/usr/bin/demobz"
 fi
 
-echo "== multi-container set (Immich style)"
+section "multi-container set (Immich style)"
 multi_reset() {
     reset_logs; rm -rf "$T/state/multi"
     printf '[Container]\nImage=ghcr.io/example/server:v1.2.3\n' > "$T/quadlet/server.container"
@@ -695,7 +716,7 @@ check "set: server quadlet restored" grep -q '^Image=ghcr.io/example/server:v1.2
 check "set: ml quadlet restored" grep -q '^Image=ghcr.io/example/ml:v1.2.3$' "$T/quadlet/ml.container"
 check "set: mail says nothing changed" grep -q 'failed before install' "$T/log/mail"
 
-echo "== container backups: same basename, revert outcome"
+section "container backups: same basename, revert outcome"
 reset_logs; rm -rf "$T/state/dup" "$T/quadlet/a" "$T/quadlet/b"; mkdir -p "$T/quadlet/a" "$T/quadlet/b"
 printf '[Container]\nImage=ghcr.io/example/one:v1.2.3\n' > "$T/quadlet/a/app.container"
 printf '[Container]\nImage=ghcr.io/example/two:v1.2.3\n' > "$T/quadlet/b/app.container"
@@ -787,7 +808,7 @@ check "rollback finishes the automatic rollback" "$RR" rollback ctr2
 check "  finished: marker cleared, installed 1.2.3, nothing skipped" bash -c "test ! -e '$T/state/ctr2/incomplete' && grep -qx 1.2.3 '$T/state/ctr2/installed' && test ! -e '$T/state/ctr2/skip' && grep -q 'finished rollback to 1.2.3' '$T/state/ctr2/last-result'"
 rm -f "$T/etc/apps.d/ctr2.conf"
 
-echo "== 0.x versions: minor policy means patches only"
+section "0.x versions: minor policy means patches only"
 jq -n '[ {tag_name:"v0.6.0",assets:[]}, {tag_name:"v0.5.2",assets:[]}, {tag_name:"v0.5.1",assets:[]} ]' > "$T/releases-zero.json"
 printf '[Container]\nImage=docker.io/example/zero:v0.5.1\n' > "$T/quadlet/zero.container"
 cat > "$T/etc/apps.d/zero.conf" <<EOF
@@ -804,7 +825,7 @@ got="$(STUB_RELEASES="$T/releases-zero.json" "$RR" check zero 2>/dev/null | awk 
 check "0.5.1 + POLICY=major picks 0.6.0 (got $got)" test "$got" = 0.6.0
 rm -f "$T/etc/apps.d/zero.conf"
 
-echo "== release sources"
+section "release sources"
 reset_logs
 echo dummy-token > "$T/etc/gitea.token"
 echo "GITEA_TOKEN_FILE=$T/etc/gitea.token" >> "$T/etc/relrotate.conf"
@@ -824,7 +845,7 @@ printf 'SOURCE=gitea:git.example/owner/repo\nLAYOUT=container\nQUADLET=x\nIMAGE=
 check "malformed gitea SOURCE is exit 2 (got $rc)" test "$rc" = 2
 rm -f "$T/etc/apps.d/gt.conf" "$T/etc/apps.d/badsrc.conf"
 
-echo "== release sources: failures are recorded and mailed once"
+section "release sources: failures are recorded and mailed once"
 echo '' > "$T/rel-empty.json"
 echo 'not json' > "$T/rel-garbage.json"
 jq -n '[ {tag_name:"nightly-2",assets:[]}, {tag_name:"nightly-1",assets:[]} ]' > "$T/rel-notags.json"
@@ -857,7 +878,7 @@ check "check records nothing" bash -c "[[ ! -e '$T/state/web/last-result' && ! -
 STUB_RELEASES="$T/rel-empty.json" "$RR" update -n web >/dev/null 2>&1 || true
 check "dry run records nothing" bash -c "[[ ! -e '$T/state/web/last-result' && ! -e '$T/log/mail' ]]"
 
-echo "== release sources: filters and ordering"
+section "release sources: filters and ordering"
 src_recipe() {   # policy allow_prerelease
     printf 'SOURCE=github:example/zero\nPOLICY=%s\nALLOW_PRERELEASE=%s\nLAYOUT=container\nQUADLET=%s\nIMAGE=%s\n' \
         "$1" "$2" "$T/quadlet/zero.container" "'docker.io/example/zero:\${TAG}'" > "$T/etc/apps.d/zero.conf"
@@ -872,6 +893,7 @@ mkdir -p "$T/state/zero"; echo 0.5.2-rc1 > "$T/state/zero/installed"
 check "installed 0.5.2-rc1 updates to the final 0.5.2" test "$(cand_of "$T/rel-rc2.json")" = 0.5.2
 rm -rf "$T/state/zero"; src_recipe minor no
 jq -n '[ {tag_name:"v0.5.2-rc1",assets:[]}, {tag_name:"v0.5.1",assets:[]} ]' > "$T/rel-rc3.json"
+check "ALLOW_PRERELEASE=no: an rc tag is skipped even when not flagged prerelease (newest 0.5.1)" test "$(newest_of "$T/rel-rc3.json")" = 0.5.1
 src_recipe patch yes
 jq -n '[ {tag_name:"v0.6.0-rc1",prerelease:true,assets:[]}, {tag_name:"v0.5.2-rc1",prerelease:true,assets:[]}, {tag_name:"v0.5.1",assets:[]} ]' > "$T/rel-rc4.json"
 check "POLICY=patch judges rcs by their numeric part (0.5.2-rc1, not 0.6.0-rc1)" test "$(cand_of "$T/rel-rc4.json")" = 0.5.2-rc1
@@ -885,7 +907,7 @@ check "a tag with a trailing newline and a null tag_name are skipped (newest 0.5
 check "expand keeps an & in a value (bash 5.2 patsub_replacement)" test "$(bash -c "shopt -s patsub_replacement 2>/dev/null; . '$here/../lib/common.sh'; VERSION=1.0.0 TAG='a&b' ARCH=x; expand '\${TAG}-\${VERSION}'")" = 'a&b-1.0.0'
 rm -f "$T/etc/apps.d/zero.conf"
 
-echo "== state module"
+section "state module"
 st() { bash -c "set -Eeuo pipefail; STATE_DIR='$T/st'; . '$here/../lib/state.sh'; $1"; }
 rm -rf "$T/st"; mkdir -p "$T/st"
 # shellcheck disable=SC2016  # expands in the child shell
@@ -898,7 +920,7 @@ check "state: incomplete blocks and names the version; held and unhealthy answer
 check "state: state_clear removes markers, absent ones are fine" st 'state_clear incomplete held nothing-here; { ! state_blocked || exit 1; }; { ! state_has held || exit 1; }; state_has unhealthy'
 rm -rf "$T/st"
 
-echo "== layout seam: a fourth adapter drives the transaction"
+section "layout seam: a fourth adapter drives the transaction"
 # lt 'adapter overrides' 'asserts': layout.sh dispatches by LAYOUT=fake; the
 # steps around the layout are stubbed, notify lands in $STATE_DIR/alert.
 lt() {
@@ -924,7 +946,7 @@ check "seam: a good flip installs" lt 'state_set installed 1.0' '( transaction_a
 }
 rm -rf "$T/lt"
 
-echo "== outcome module: the table of revert results"
+section "outcome module: the table of revert results"
 # oc 'REVERT_*=... state...' 'function' 'asserts': fresh STATE_DIR, notify and
 # log stubbed; the alert title lands in $STATE_DIR/alert, the record in last-result.
 oc() {
@@ -956,7 +978,7 @@ check "recheck: passes again clears unhealthy, still failing keeps it" oc "state
 }
 rm -rf "$T/oc"
 
-echo "== release sources: the asset must exist"
+section "release sources: the asset must exist"
 reset_logs; web_install_old; web_recipe minor api-digest
 jq '[{tag_name:"v1.4.0",prerelease:false,draft:false,assets:[]}] + .' "$T/releases.json" > "$T/rel-late.json"
 STUB_RELEASES="$T/rel-late.json" "$RR" check web >"$T/out" 2>"$T/err" || true
@@ -965,7 +987,7 @@ check "warning names the version lacking the asset" grep -q 'level=warning.*vers
 check "update installs 1.3.0 instead of failing" env STUB_RELEASES="$T/rel-late.json" "$RR" update web
 check "  symlink on 1.3.0" test "$(readlink "$T/www/demo")" = "$T/www/demo-releases/1.3.0"
 
-echo "== release sources: tokens and curl arguments"
+section "release sources: tokens and curl arguments"
 reset_logs; web_install_old; web_recipe minor api-digest
 "$RR" update web >/dev/null 2>&1 || true
 check "API call: --proto =https --proto-redir =https -- URL" grep -q -- '--proto =https --proto-redir =https .* -- https://api.github.com/' "$T/log/curl"
@@ -990,7 +1012,7 @@ echo "GITEA_TOKEN_FILE=$T/etc/missing.token" >> "$T/etc/relrotate.conf"
 check "unreadable token file fails instead of going unauthenticated (got $rc)" test "$rc" = 1
 cp "$T/etc/relrotate.conf.bak" "$T/etc/relrotate.conf"; rm -f "$T/etc/relrotate.conf.bak" "$T/etc/apps.d/gt.conf"
 
-echo "== verification details"
+section "verification details"
 # lib_unit SCRIPT: run SCRIPT with the libraries sourced and a one-release list.
 lib_unit() {
     ( cd "$T" && bash -c "
@@ -1019,7 +1041,7 @@ printf '%s  ./demo-1.3.0.tar.gz\r\n' "$(sha "$T/assets/demo-1.3.0.tar.gz")" > "$
 check "checksums file with CRLF and a ./name entry verifies" "$RR" update web
 mv "$T/assets/checksums.orig" "$T/assets/checksums.txt"
 
-echo "== config errors"
+section "config errors"
 printf 'SOURCE=github:a/b\nASSET=x\nLAYOUT=binary\nTARGET=/tmp/x\n' > "$T/etc/apps.d/noverify.conf"
 "$RR" check noverify >/dev/null 2>&1 && rc=0 || rc=$?
 check "missing VERIFY is exit 2 (got $rc)" test "$rc" = 2
@@ -1036,7 +1058,7 @@ check "status lists apps" bash -c "'$RR' status | grep -q '^web '"
 check "relrotate runs when it has to look for sendmail itself (no MTA: still exit 0)" \
     bash -c "env -u RELROTATE_SENDMAIL '$RR' list >/dev/null"
 
-echo "== install layout: PREFIX/sbin and PREFIX/lib/relrotate"
+section "install layout: PREFIX/sbin and PREFIX/lib/relrotate"
 rm -rf "$T/pfx"; mkdir -p "$T/pfx/sbin" "$T/pfx/lib/relrotate"
 cp "$RR" "$T/pfx/sbin/relrotate"; cp "$here"/../lib/*.sh "$T/pfx/lib/relrotate/"
 check "relrotate finds PREFIX/lib/relrotate next to PREFIX/sbin (RELROTATE_LIB_DIR unset)" \
@@ -1046,12 +1068,14 @@ check "  also through a symlink" bash -c "unset RELROTATE_LIB_DIR; '$T/pfx-link'
 check "  RELROTATE_LIB_DIR still wins" bash -c "RELROTATE_LIB_DIR='$T/nowhere' '$T/pfx/sbin/relrotate' --version 2>/dev/null; test \$? != 0"
 rm -rf "$T/pfx" "$T/pfx-link"
 
-echo "== CLI parsing"
+section "CLI parsing"
 reset_logs; web_install_old; web_recipe minor api-digest
 rc_of() { local rc=0; "$@" >/dev/null 2>&1 || rc=$?; echo "$rc"; }
 check "unknown option rejected, exit 2" test "$(rc_of "$RR" update web --dryrun)" = 2
 check "unknown option: nothing installed" test "$(readlink "$T/www/demo")" = "$T/www/demo-releases/1.2.3"
 check "unknown option before the command rejected" test "$(rc_of "$RR" --bogus list)" = 2
+check "--no-skip on another command: exit 2" test "$(rc_of "$RR" update --no-skip web)" = 2
+check "unskip -n: exit 2" test "$(rc_of "$RR" unskip -n web)" = 2
 check "extra argument to update rejected" test "$(rc_of "$RR" update web extra)" = 2
 check "extra argument to list rejected" test "$(rc_of "$RR" list extra)" = 2
 check "extra argument to status rejected" test "$(rc_of "$RR" status web extra)" = 2
@@ -1063,7 +1087,7 @@ check "bare relrotate prints usage on stderr" bash -c "'$RR' 2>&1 >/dev/null | g
 check "relrotate help exits 0" test "$(rc_of "$RR" help)" = 0
 check "options after the app still work (update web -n)" test "$(rc_of "$RR" update web -n)" = 0
 
-echo "== app names"
+section "app names"
 cp "$T/etc/apps.d/web.conf" "$T/etc/apps.d/..conf"
 cp "$T/etc/apps.d/web.conf" "$T/etc/apps.d/...conf"
 check "app name . rejected" test "$(rc_of "$RR" update .)" = 2
@@ -1073,7 +1097,7 @@ check "status .. rejected" test "$(rc_of "$RR" status ..)" = 2
 check "status of a name with a slash rejected" test "$(rc_of "$RR" status ../etc)" = 2
 rm -f "$T/etc/apps.d/..conf" "$T/etc/apps.d/...conf"
 
-echo "== numeric settings"
+section "numeric settings"
 for kv in HEALTH_RETRIES=0 HEALTH_RETRIES=x HEALTH_DELAY=abc HEALTH_DELAY= KEEP=0 KEEP=a1; do
     web_install_old; web_recipe minor api-digest; echo "${kv%%=*}='${kv#*=}'" >> "$T/etc/apps.d/web.conf"
     check "$kv rejected before anything runs, exit 2" test "$(rc_of "$RR" update web)" = 2
@@ -1087,7 +1111,7 @@ check "app name starting with _ is accepted" test "$(rc_of "$RR" check _web)" = 
 check "app name starting with . is rejected" test "$(rc_of "$RR" check .web)" = 2
 rm -f "$T/etc/apps.d/_web.conf" "$T/etc/apps.d/.web.conf"; web_recipe minor api-digest
 
-echo "== log escaping"
+section "log escaping"
 out="$(bash -c ". '$here/../lib/common.sh'; APP=web; log err msg=\$'x\nrelrotate level=err app=evil'" 2>&1)"
 check "a newline in a value cannot forge a log line" test "$(wc -l <<<"$out")" = 1
 check "newline is escaped as \\n" grep -q 'x\\nrelrotate' <<<"$out"
@@ -1095,8 +1119,9 @@ out="$(bash -c ". '$here/../lib/common.sh'; APP=web; log err msg='a\\nb'" 2>&1)"
 check "a literal backslash-n is escaped, so it differs from a newline" grep -qF 'msg=a\\nb' <<<"$out"
 out="$(bash -c ". '$here/../lib/common.sh'; APP=web; log err msg=\$'a\rb'" 2>&1)"
 check "a carriage return is escaped too" bash -c "[[ '$out' != *$'\r'* ]]"
+check "  as \\r" grep -qF 'msg=a\rb' <<<"$out"
 
-echo "== lock fd is closed for hooks and sendmail"
+section "lock fd is closed for hooks and sendmail"
 reset_logs; web_install_old; web_recipe minor api-digest
 cat >> "$T/etc/apps.d/web.conf" <<HOOK
 post_extract() { if ( : >&9 ) 2>/dev/null; then echo open > "$T/fd9-hook"; else echo closed > "$T/fd9-hook"; fi; }
@@ -1113,16 +1138,7 @@ check "hook does not inherit the lock fd" test "$(cat "$T/fd9-hook")" = closed
 check "sendmail does not inherit the lock fd" test "$(cat "$T/fd9-mail")" = closed
 rm -f "$T/fd9-hook" "$T/fd9-mail" "$T/sendmail-fd"
 
-echo "== TERM before the flip"
-reset_logs; web_install_old; web_recipe minor api-digest
-echo 'pre_update() { kill -TERM $$; sleep 1; }' >> "$T/etc/apps.d/web.conf"
-check "TERM before the flip exits 143" test "$(rc_of "$RR" update web)" = 143
-check "TERM before the flip: symlink unchanged" test "$(readlink "$T/www/demo")" = "$T/www/demo-releases/1.2.3"
-check "TERM before the flip: last-result says nothing changed" grep -q 'interrupted before install of 1.3.0, nothing changed' "$T/state/web/last-result"
-check "TERM before the flip: no incomplete marker" test ! -e "$T/state/web/incomplete"
-check "TERM before the flip: work dir cleaned up" bash -c "[[ -z \$(ls -d '$T'/state/web/work.* 2>/dev/null) ]]"
-
-echo "== failures before install: one alert per version and reason"
+section "failures before install: one alert per version and reason"
 reset_logs; web_install_old; web_recipe minor api-digest
 echo 'pre_update() { false; }' >> "$T/etc/apps.d/web.conf"
 for i in 1 2 3; do "$RR" update web >/dev/null 2>&1 || true; done
@@ -1140,9 +1156,13 @@ echo 'pre_update() { false; }' >> "$T/etc/apps.d/web.conf"
 "$RR" update web >/dev/null 2>&1 || true
 check "  so the same failure later alerts again" test "$(grep -c 'failed before install' "$T/log/mail")" = 3
 reset_logs; web_install_old; web_recipe minor api-digest
-echo 'pre_update() { kill -TERM $$; sleep 1; }' >> "$T/etc/apps.d/web.conf"
-"$RR" update web >/dev/null 2>&1 || true
-check "TERM before the flip: one alert" test "$(grep -c 'INTERRUPTED before install' "$T/log/mail")" = 1
+echo 'pre_update() { kill -TERM $$; sleep 0.1; }' >> "$T/etc/apps.d/web.conf"
+check "TERM before the flip exits 143" test "$(rc_of "$RR" update web)" = 143
+check "  symlink unchanged" test "$(readlink "$T/www/demo")" = "$T/www/demo-releases/1.2.3"
+check "  last-result says nothing changed" grep -q 'interrupted before install of 1.3.0, nothing changed' "$T/state/web/last-result"
+check "  no incomplete marker" test ! -e "$T/state/web/incomplete"
+check "  work dir cleaned up" bash -c "[[ -z \$(ls -d '$T'/state/web/work.* 2>/dev/null) ]]"
+check "  one alert" test "$(grep -c 'INTERRUPTED before install' "$T/log/mail")" = 1
 "$RR" update web >/dev/null 2>&1 || true
 check "  none for the same interruption again" test "$(grep -c 'INTERRUPTED before install' "$T/log/mail")" = 1
 check "  last-result is written each time" grep -q 'interrupted before install of 1.3.0, nothing changed' "$T/state/web/last-result"
@@ -1156,9 +1176,9 @@ STUB_RELEASES="$T/releases-bad.json" "$RR" update web >/dev/null 2>&1 || true
 check "  the same mismatch again: none" test "$(grep -c 'failed before install' "$T/log/mail")" = 2
 check "  last-result keeps its text" grep -q '^failed 1.3.0 (download/verification failed), nothing changed' "$T/state/web/last-result"
 
-echo "== TERM after the flip"
+section "TERM after the flip"
 reset_logs; web_install_old; web_recipe minor api-digest
-echo 'post_flip() { kill -TERM $$; sleep 1; }' >> "$T/etc/apps.d/web.conf"
+echo 'post_flip() { kill -TERM $$; sleep 0.1; }' >> "$T/etc/apps.d/web.conf"
 check "TERM after the flip exits 143" test "$(rc_of "$RR" update web)" = 143
 check "TERM after the flip: incomplete names the old version" test "$(cat "$T/state/web/incomplete" 2>/dev/null)" = 1.2.3
 check "TERM after the flip: last-result says so" grep -q 'interrupted while switching between 1.2.3 and 1.3.0; updates blocked until: relrotate rollback web' "$T/state/web/last-result"
@@ -1171,29 +1191,32 @@ check "rollback after the interrupt succeeds" test "$(rc_of "$RR" rollback web)"
 check "rollback restores the old version" test "$(readlink "$T/www/demo")" = "$T/www/demo-releases/1.2.3"
 check "rollback clears the incomplete marker" test ! -e "$T/state/web/incomplete"
 
-echo "== TERM during the flip, after the commit, during a rollback"
+section "TERM during the flip, after the commit, during a rollback"
 reset_logs; web_install_old; web_recipe minor api-digest
-echo 'layout_symlink_flip() { kill -TERM $$; sleep 1; }' >> "$T/etc/apps.d/web.conf"   # simulates a signal inside the flip
+echo 'layout_symlink_flip() { kill -TERM $$; sleep 0.1; }' >> "$T/etc/apps.d/web.conf"   # simulates a signal inside the flip
 "$RR" update web >/dev/null 2>&1 || true
 check "TERM inside the flip leaves the incomplete marker" test "$(cat "$T/state/web/incomplete" 2>/dev/null)" = 1.2.3
 reset_logs; web_install_old; web_recipe minor api-digest
 # shellcheck disable=SC2016  # written into the recipe literally
-echo 'notify() { [[ "$1" == updated* ]] || return 0; kill -TERM $$; sleep 1; }' >> "$T/etc/apps.d/web.conf"   # a signal during the success mail
+echo 'notify() { [[ "$1" == updated* ]] || return 0; kill -TERM $$; sleep 0.1; }' >> "$T/etc/apps.d/web.conf"   # a signal during the success mail
 check "TERM during the success mail exits 143" test "$(rc_of "$RR" update web)" = 143
 check "  the recorded success is not overwritten" grep -q '^updated 1.2.3 -> 1.3.0$' "$T/state/web/last-result"
 check "  no incomplete marker" test ! -e "$T/state/web/incomplete"
 reset_logs; web_install_old; web_recipe minor api-digest; "$RR" update web >/dev/null 2>&1
-echo 'on_rollback() { kill -TERM $$; sleep 1; }' >> "$T/etc/apps.d/web.conf"
+echo 'on_rollback() { kill -TERM $$; sleep 0.1; }' >> "$T/etc/apps.d/web.conf"
 check "TERM during a manual rollback exits 143" test "$(rc_of "$RR" rollback web)" = 143
 check "  leaves the incomplete marker naming the target" test "$(cat "$T/state/web/incomplete" 2>/dev/null)" = 1.2.3
 web_recipe minor api-digest
 check "  rollback again finishes it" bash -c "'$RR' rollback web >/dev/null 2>&1 && test ! -e '$T/state/web/incomplete' && test \"\$(readlink '$T/www/demo')\" = '$T/www/demo-releases/1.2.3'"
 
-echo "== unhealthy after a rollback is checked again"
+section "unhealthy after a rollback is checked again"
 reset_logs; web_install_old; web_recipe minor api-digest; "$RR" update web >/dev/null 2>&1
 touch "$T/unhealthy"
 check "rollback with a failing health check exits 1" test "$(rc_of "$RR" rollback web)" = 1
 check "  unhealthy marker names 1.2.3" test "$(cat "$T/state/web/unhealthy" 2>/dev/null)" = 1.2.3
+check "  state records 1.2.3 as installed, 1.3.0 skipped" test "$(cat "$T/state/web/installed"):$(cat "$T/state/web/skip")" = 1.2.3:1.3.0
+check "  last-result says UNHEALTHY" grep -q UNHEALTHY "$T/state/web/last-result"
+check "  mail sent" grep -q 'manual rollback' "$T/log/mail"
 check "  status shows UNHEALTHY before last=" bash -c "'$RR' status web | sed 's/ last=.*//' | grep -q 'UNHEALTHY(1.2.3)'"
 # Only 1.2.3 and the skipped 1.3.0 exist, so these runs have nothing to install.
 releases_json | jq '[.[] | select(.tag_name == "v1.2.3" or .tag_name == "v1.3.0")]' > "$T/rel-nonew.json"
@@ -1217,19 +1240,18 @@ check "  then a plain run records ok" bash -c "'$RR' update web >/dev/null 2>&1 
 unset STUB_RELEASES
 echo 1.2.3 > "$T/state/web/unhealthy"
 check "adopt clears the unhealthy marker" bash -c "'$RR' adopt web 1.2.3 >/dev/null && test ! -e '$T/state/web/unhealthy'"
-reset_logs; web_install_old; web_recipe minor api-digest; "$RR" update web >/dev/null 2>&1
-echo 'on_rollback() { return 1; }' >> "$T/etc/apps.d/web.conf"
-"$RR" rollback web >/dev/null 2>&1 || true
-check "rollback where only a hook failed: 'with problems', not UNHEALTHY" bash -c "grep -q 'with problems' '$T/state/web/last-result' && ! grep -q UNHEALTHY '$T/state/web/last-result' && test ! -e '$T/state/web/unhealthy'"
+echo 'failed 1.3.0 (health check failed), ROLLBACK ALSO FAILED: switching back to 1.2.2 failed' > "$T/state/web/last-result"
+check "adopt <app> <version> replaces a past failure in status" \
+    bash -c "'$RR' adopt web 1.2.3 >/dev/null && s=\$('$RR' status web) && grep -q 'last=adopted 1.2.3 by hand (' <<<\"\$s\" && ! grep -q FAILED <<<\"\$s\""
 web_recipe minor api-digest
 
-echo "== automatic rollback that leaves the old version unhealthy"
+section "automatic rollback that leaves the old version unhealthy"
 reset_logs; web_install_old; web_recipe minor api-digest; touch "$T/unhealthy"
 check "update fails" test "$(rc_of "$RR" update web)" = 1
 check "  rolled back, old version marked unhealthy" bash -c "test \"\$(readlink '$T/www/demo')\" = '$T/www/demo-releases/1.2.3' && test \"\$(cat '$T/state/web/unhealthy')\" = 1.2.3"
 rm -f "$T/unhealthy"
 
-echo "== automatic rollback that cannot switch back"
+section "automatic rollback that cannot switch back"
 reset_logs; rm -rf "$T/state/ctr3"
 printf '[Container]\nImage=ghcr.io/example/demo:v1.2.3\n' > "$T/quadlet/demo.container"
 { cat "$T/etc/apps.d/ctr.conf"; echo "post_flip() { rm -f '$T/quadlet/demo.container'; ln -s '$T/nonexistent/q' '$T/quadlet/demo.container'; return 1; }"; } > "$T/etc/apps.d/ctr3.conf"
@@ -1241,7 +1263,7 @@ sed -i '/^post_flip/d' "$T/etc/apps.d/ctr3.conf"
 check "  rollback then finishes it" bash -c "'$RR' rollback ctr3 >/dev/null 2>&1 && grep -q '^Image=ghcr.io/example/demo:v1.2.3$' '$T/quadlet/demo.container' && test ! -e '$T/state/ctr3/incomplete'"
 rm -f "$T/etc/apps.d/ctr3.conf"
 
-echo "== mail"
+section "mail"
 reset_logs; web_install_old; web_recipe minor api-digest
 hn="$(readlink -f "$T/sysbin/hostname" 2>/dev/null || true)"
 rm -f "$T/sysbin/hostname"
@@ -1253,7 +1275,7 @@ reset_logs; web_install_old
 out="$(RELROTATE_SENDMAIL=/nonexistent/sendmail "$RR" update web 2>&1 >/dev/null || true)"
 check "MAIL_TO set but no sendmail is a warning" grep -q 'level=warning.*no sendmail' <<<"$out"
 
-echo "== update-all"
+section "update-all"
 rm -rf "$T/etc2" "$T/state/a1" "$T/state/a2"; mkdir -p "$T/etc2/apps.d"
 reset_logs; web_install_old; web_recipe minor api-digest
 cp "$T/etc/apps.d/web.conf" "$T/etc2/apps.d/a1.conf"
@@ -1264,16 +1286,16 @@ check "update-all: a1 updated" test "$(readlink "$T/www/demo")" = "$T/www/demo-r
 check "update-all: a hook reading stdin does not eat the app list (a2 ran)" test -s "$T/state/a2/last-check"
 rm -rf "$T/etc2" "$T/state/a1" "$T/state/a2"
 
-echo "== adopt takes the lock"
+section "adopt takes the lock"
 web_install_old; web_recipe minor api-digest; mkdir -p "$T/state/web"
-( exec 9>"$T/state/web/lock"; flock 9; sleep 3 ) &
-holder=$!
-sleep 0.5
+# The test shell holds the lock, as a running update would: relrotate opens
+# its own descriptor on the file, so its flock -n is refused.
+exec 8>"$T/state/web/lock"; flock 8
 check "adopt refused while update holds the lock" test "$(rc_of "$RR" adopt web 1.2.3)" = 1
-kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+exec 8>&-
 check "adopt works when the lock is free" test "$(rc_of "$RR" adopt web 1.2.3)" = 0
 
-echo "== hooks stop at their first failing step"
+section "hooks stop at their first failing step"
 reset_logs; web_install_old; web_recipe minor api-digest
 echo "pre_update() { false; touch '$T/after-false'; }" >> "$T/etc/apps.d/web.conf"
 check "a failing first step fails pre_update" test "$(rc_of "$RR" update web)" = 1
@@ -1302,7 +1324,7 @@ check "a hook run inside a condition counts as failed (errexit guard)" \
 check "a hook run as a statement passes (control)" \
     test "$(bash -c "set -e; . '$here/../lib/common.sh'; h() { :; }; run_hook h; echo \$HOOK_RC" 2>/dev/null)" = 0
 
-echo "== chat notifications"
+section "chat notifications"
 printf 'https://discord.example/api/webhooks/1/DSECRET\n' > "$T/etc/discord.url"
 printf 'TGSECRET\n-100123\n' > "$T/etc/tg"
 printf 'https://ntfy.example/NSECRET\n' > "$T/etc/ntfy.url"
@@ -1363,7 +1385,7 @@ bash -c ". '$here/../lib/common.sh'; . '$here/../lib/source.sh'; . '$here/../lib
 check "a long ntfy body is cut below its 4096 bytes" \
     bash -c "l=\$(tr '\n' ' ' < '$T/log/bodies'); (( \${#l} < 4000 )) && grep -qF 'cut; see relrotate status' <<<\"\$l\""
 
-echo "== notify adapters and policy"
+section "notify adapters and policy"
 # Each adapter builds its payload; the secret never leaves via the arguments.
 nt() { bash -c ". '$here/../lib/common.sh'; . '$here/../lib/source.sh'; . '$here/../lib/notify.sh'; CURL='$T/bin/curl'; APP=a
     host_name() { echo h; }; x() { local s; printf -v s '%*s' \$1; printf '%s' \"\${s// /x}\"; }; $1" 2>&1; }
@@ -1422,7 +1444,7 @@ check "policy digest: both queued" test "$(pol digest)" = "queue:s1 queue:s2 "
 check "update-all runs a digest unless policy is each" test "$(nt "NOTIFY_POLICY=each; notify_digest_wanted && echo y; NOTIFY_POLICY=failures; notify_digest_wanted && echo y")" = y
 echo 'MAIL_TO=root@example.net' > "$T/etc/relrotate.conf"
 
-echo "== NOTIFY_POLICY and the summary"
+section "NOTIFY_POLICY and the summary"
 rm -f "$T/state/.outbox" "$T/state/.outbox.sending"
 printf 'MAIL_TO=root@example.net\nNOTIFY_POLICY=failures\n' > "$T/etc/relrotate.conf"
 reset_logs; web_install_old; web_recipe minor api-digest
@@ -1533,7 +1555,7 @@ check "an unknown NOTIFY_POLICY is a config error" test "$(rc_of "$RR" status)" 
 echo 'MAIL_TO=root@example.net' > "$T/etc/relrotate.conf"
 rm -f "$T/state/.outbox" "$T/state/.outbox.sending"
 
-echo "== MIN_AGE_DAYS"
+section "MIN_AGE_DAYS"
 jq --arg n "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg o "$(date -u -d '-10 days' +%Y-%m-%dT%H:%M:%SZ)" \
    --arg oo "$(date -u -d '-100 days' +%Y-%m-%dT%H:%M:%SZ)" \
    'map(.published_at = (if .tag_name == "v1.3.0" then $n elif .tag_name == "v1.2.4" then $o else $oo end))' \
@@ -1566,7 +1588,7 @@ check "MIN_AGE_DAYS with a leading zero is refused, not read as octal" test "$(r
 check "a Gitea date with an offset is read" test "$(bash -c ". '$here/../lib/common.sh'; . '$here/../lib/source.sh'; MIN_AGE_DAYS=1
     RELEASES='[{\"version\":\"1.0.0\",\"published\":\"2020-01-01T12:00:00+02:00\"}]'; release_ripe_at 1.0.0")" = 2020-01-02T10:00:00Z
 
-echo "== hold / unhold"
+section "hold / unhold"
 reset_logs; web_install_old; web_recipe minor api-digest
 check "hold" "$RR" hold web "db migration"
 check "a held update changes nothing and exits 0" \
@@ -1580,7 +1602,7 @@ check "  updates run again" bash -c "'$RR' update web 2>/dev/null && test \"\$(r
 check "unhold when not held says so" bash -c "'$RR' unhold web | grep -q 'not held'"
 check "hold an unknown app fails" test "$(rc_of "$RR" hold nosuch)" = 2
 
-echo "== enable / disable"
+section "enable / disable"
 reset_logs
 check "enable turns the app's timer on" bash -c "'$RR' enable web >/dev/null && grep -qx 'systemctl enable --now relrotate@web.timer' '$T/log/systemctl'"
 check "disable turns it off" bash -c "'$RR' disable web >/dev/null && grep -qx 'systemctl disable --now relrotate@web.timer' '$T/log/systemctl'"
@@ -1598,7 +1620,7 @@ check "enable without MAIL_TO or NOTIFY points at relrotate.conf" bash -c "'$RR'
 check "  disable does not" bash -c "! '$RR' disable web | grep -q 'journal only'"
 mv "$T/etc/relrotate.conf.bak" "$T/etc/relrotate.conf"
 
-echo "== setup"
+section "setup"
 rm -f "$T/etc/discord.url"
 cp "$T/etc/relrotate.conf" "$T/etc/relrotate.conf.bak"
 check "setup with notifications already set says so" bash -c "'$RR' setup </dev/null | grep -q 'already set'"
@@ -1623,13 +1645,13 @@ check "  doctor accepts the result" bash -c "'$RR' doctor web 2>&1 | grep -q 'ok
 check "setup has no --dry-run" test "$(rc_of "$RR" setup -n)" = 2
 rm -f "$T/etc/discord.url" "$T/etc/webhook.url" "$T/etc/empty.conf"; mv "$T/etc/relrotate.conf.bak" "$T/etc/relrotate.conf"
 
-echo "== large release list"
+section "large release list"
 # headscale's list is 2.5 MB; a per-character bash rewrite of it took minutes.
 jq '.[0].body = ("release notes line with words\n" * 85000)' "$T/releases.json" > "$T/releases-big.json"
 check "check finishes on a 2.5 MB release list" \
     bash -c "STUB_RELEASES='$T/releases-big.json' timeout 30 '$RR' check web 2>/dev/null | grep -q '^newest'"
 
-echo "== doctor says whether backups are taken"
+section "doctor says whether backups are taken"
 web_recipe minor api-digest
 check "no backup hook: doctor says so" bash -c "'$RR' doctor web 2>&1 | grep -q 'note  no backup hook: updates take no backup'"
 echo "pre_update() { backup_sqlite '$T/none.db' db; }" >> "$T/etc/apps.d/web.conf"
@@ -1637,7 +1659,8 @@ check "backup hook: doctor says a backup runs and how to turn it off" \
     bash -c "'$RR' doctor web 2>&1 | grep -q 'note  a hook takes a backup before every update, to .*remove the hook'"
 web_recipe minor api-digest
 
-echo "== status --json"
+section "status --json"
+reset_logs; web_install_old; web_recipe minor api-digest; "$RR" update web >/dev/null 2>&1
 out="$("$RR" status --json)"
 check "status --json is one JSON array" jq -e 'type == "array" and length >= 1' <<<"$out"
 check "  with the fields of each app" jq -e '.[] | select(.app == "web") | .installed == "1.3.0" and .previous == "1.2.3" and .held == null and (.last_result | startswith("updated"))' <<<"$out"
@@ -1645,7 +1668,7 @@ check "  for one app" bash -c "'$RR' status web --json | jq -e 'length == 1 and 
 check "--json is refused for other commands" test "$(rc_of "$RR" list --json)" = 2
 check "text status keeps its columns" bash -c "'$RR' status web | grep -qE '^web {14}installed=1\.3\.0 {8}previous=1\.2\.3 {8}last-check=[^ ]+ +last=updated 1\.2\.3 -> 1\.3\.0$'"
 
-echo "== doctor"
+section "doctor"
 rm -rf "$T/etc3"; mkdir -p "$T/etc3/apps.d"; cp "$T/etc/relrotate.conf" "$T/etc3/"
 reset_logs; web_install_old; web_recipe minor sha256-sidecar
 cp "$T/etc/apps.d/web.conf" "$T/etc3/apps.d/web.conf"
@@ -1664,7 +1687,7 @@ check "doctor on a good app exits 0" bash -c "RELROTATE_CONF_DIR='$T/etc3' '$RR'
 out="$(STUB_RELEASES="$T/empty.json" RELROTATE_CONF_DIR="$T/etc3" "$RR" doctor web 2>&1)" || true
 check "a failing release check is reported" grep -q 'FAIL  release check fails: .*empty response' <<<"$out"
 check "doctor changes no state" bash -c "test ! -e '$T/state/web/check-failed' && test ! -e '$T/state/web/last-result' && test ! -e '$T/state/web/last-check'"
-echo "== doctor: permissions of config, recipes, keys and secret files"
+section "doctor: permissions of config, recipes, keys and secret files"
 # Owned by root, or by the invoking user when the tests run unprivileged; not
 # writable by group or others; secret files not readable by them either.
 dp_fresh() {
@@ -1721,7 +1744,7 @@ rm -rf "$T/etc4"
 
 # doctor and the update path share lib/verify.sh's method list: a release
 # missing what a method needs is flagged by one and refused by the other.
-echo "== doctor and update agree on VERIFY"
+section "doctor and update agree on VERIFY"
 check "verify_known takes one method, never a list or an empty value" bash -c ". '$here/../lib/verify.sh'; verify_known gpg && { ! verify_known 'api-digest sha256-sidecar' || exit 1; } && { ! verify_known '' || exit 1; }"
 jq -n --arg u "file://$T/assets/demo-1.3.0.tar.gz" '[{tag_name:"v2.0.0",prerelease:false,draft:false,assets:[{name:"demo-2.0.0.tar.gz",browser_download_url:$u}]}]' > "$T/rel-bare.json"
 agree() {   # method [extra recipe line]: doctor output in $out, update rc in $urc, its log in $T/log/err
@@ -1765,7 +1788,7 @@ reset_logs; STUB_RELEASES="$T/empty.json" RELROTATE_CONF_DIR="$T/etc3" "$RR" doc
 check "  and once when the fetch fails" test "$(grep -c 'api.github.com' "$T/log/curl")" = 1
 rm -rf "$T/etc3" "$T/state/renamed" "$T/state/broken"
 
-echo "== current_version fails (broken binary)"
+section "current_version fails (broken binary)"
 web_on_new; echo 'current_version() { /nonexistent/app --version; }' >> "$T/etc/apps.d/web.conf"
 rc=0; "$RR" update web >/dev/null 2>"$T/log/err" || rc=$?
 check "update exits 1 and names current_version in the log" bash -c "test '$rc' = 1 && grep -q 'level=err.*current_version' '$T/log/err'"
@@ -1784,7 +1807,7 @@ check "no current version at all: rollback still switches to previous, exit 0" b
 check "  and no state file is empty or a lone newline" test -z "$(find "$T/state/web" -maxdepth 1 -type f ! -name lock -exec grep -L '[^[:space:]]' {} +)"
 web_recipe minor api-digest
 
-echo "== the installed version must be a version"
+section "the installed version must be a version"
 web_on_new
 echo 'current_version() { echo "v1.2.3"; }' >> "$T/etc/apps.d/web.conf"
 check "current_version printing v1.2.3 reads as 1.2.3" bash -c "'$RR' check web 2>/dev/null | grep -qE '^installed +1\.2\.3\$'"
@@ -1811,7 +1834,7 @@ for v in latest "1.2.3 beta" "1..2" "-1.2.3" "1.2.3-"; do
 done
 web_recipe minor api-digest
 
-echo "== hostile asset and tag names stay in the work dir"
+section "hostile asset and tag names stay in the work dir"
 evil_recipe() {   # extra recipe lines
     web_install_old; web_recipe major "${EVIL_VERIFY:-none}"
     printf '%s\n' "VERSION_REGEX='(?<v>[0-9]+\\.[0-9]+\\.[0-9]+)'" "ASSET='\${TAG}.tar.gz'" "$@" >> "$T/etc/apps.d/web.conf"
@@ -1841,7 +1864,7 @@ STUB_RELEASES="$T/releases.json" "$RR" update web >/dev/null 2>&1 || true
 check "downloads switch curl URL globbing off" grep -q -- '--globoff.* -o .*demo-2.0.0.tar.gz' "$T/log/curl"
 web_recipe minor api-digest
 
-echo "== version comparison"
+section "version comparison"
 tags_release() {   # tag...: releases carrying a demo-<version>.tar.gz asset each
     local t v u
     local -a rs=()
@@ -1851,20 +1874,20 @@ tags_release() {   # tag...: releases carrying a demo-<version>.tar.gz asset eac
     done
     ( IFS=,; echo "[${rs[*]}]" ) > "$T/rel-tags.json"
 }
-cand_of() { STUB_RELEASES="$T/rel-tags.json" "$RR" check web 2>/dev/null | awk '$1=="candidate"{print $2}'; }
+tags_cand() { STUB_RELEASES="$T/rel-tags.json" "$RR" check web 2>/dev/null | awk '$1=="candidate"{print $2}'; }
 web_install_old; web_recipe patch api-digest
 tags_release v1.2.3 v1.18446744073709551618.0
-check "a 20-digit version component is dropped, not wrapped (candidate: $(cand_of))" test "$(cand_of)" = "none"
+c="$(tags_cand)"; check "a 20-digit version component is dropped, not wrapped (candidate: $c)" test "$c" = "none"
 web_recipe major api-digest
-check "  also under POLICY=major" test "$(cand_of)" = "none"
+check "  also under POLICY=major" test "$(tags_cand)" = "none"
 web_recipe major api-digest; echo 1.9 > "$T/state/web/installed"
 tags_release v1.9.0 v1.09.0 v1.9
-check "1.9.0, 1.09.0 and 1.9 are not newer than an installed 1.9 (candidate: $(cand_of))" test "$(cand_of)" = "none"
-echo 1.9.0 > "$T/state/web/installed"; tags_release v1.2.3 v01.9.0
+c="$(tags_cand)"; check "1.9.0, 1.09.0 and 1.9 are not newer than an installed 1.9 (candidate: $c)" test "$c" = "none"
+tags_release v1.2.3 v01.9.0
 echo 1.9.0 > "$T/state/web/skip"; echo 1.2.3 > "$T/state/web/installed"
-check "skip=1.9.0 also skips the tag 01.9.0 (candidate: $(cand_of))" test "$(cand_of)" = "none"
+c="$(tags_cand)"; check "skip=1.9.0 also skips the tag 01.9.0 (candidate: $c)" test "$c" = "none"
 rm -f "$T/state/web/skip"
-check "  without the skip, 01.9.0 is a candidate and keeps its spelling" test "$(cand_of)" = "01.9.0"
+check "  without the skip, 01.9.0 is a candidate and keeps its spelling" test "$(tags_cand)" = "01.9.0"
 check "adopt refuses a 20-digit component too" test "$(rc_of "$RR" adopt web 1.18446744073709551618.0)" = 2
 check "adopt accepts a long date suffix (only numeric components are limited)" test "$(rc_of "$RR" adopt web 1.2.3-20240101123456)" = 0
 vcmp() { bash -c ". '$here/../lib/common.sh'; $1" >/dev/null 2>&1; }
@@ -1879,7 +1902,7 @@ check "1.2.3.4 is older than 1.2.4" vcmp "version_gt 1.2.4 1.2.3.4"
 check "same_version: 1.2.3.4 is itself, and not 2026.11.0b6 vs 2026.11.0" vcmp "same_version 1.2.3.4 1.2.3.4 && ! same_version 2026.11.0b6 2026.11.0"
 web_recipe minor api-digest
 
-echo "== special archive members and modes"
+section "special archive members and modes"
 rm -rf "$T/build/sp" "$T/build/ok"; mkdir -p "$T/build/sp/demo" "$T/build/ok/demo"
 echo hi > "$T/build/sp/demo/VERSION"; mkfifo "$T/build/sp/demo/pipe"
 tar -czf "$T/assets/fifo.tar.gz" -C "$T/build/sp" demo
@@ -1898,7 +1921,7 @@ check "a normal archive still installs, executable (exit $rc)" test "$rc" = 0 -a
 check "  and a setuid bit in the archive does not survive" test ! -u "$T/www/demo-releases/1.9.0/run"
 web_recipe minor api-digest
 
-echo "== container image digests"
+section "container image digests"
 cat > "$T/etc/apps.d/ctr.conf" <<EOF
 SOURCE=github:example/demo
 POLICY=minor
@@ -1944,7 +1967,7 @@ repo_of() { bash -c ". '$here/../lib/common.sh'; . '$here/../lib/layout-containe
 check "image_repo drops the tag" test "$(repo_of reg.example:5000/a/b:v1)" = reg.example:5000/a/b
 check "image_repo keeps a registry port when there is no tag" test "$(repo_of reg.example:5000/a/b)" = reg.example:5000/a/b
 
-echo "== container: quadlet on another version than recorded (killed after the flip)"
+section "container: quadlet on another version than recorded (killed after the flip)"
 ctr_fresh; "$RR" update ctr >/dev/null 2>&1
 echo 1.2.3 > "$T/state/ctr/installed"   # the run died before "installed" was written
 cp "$T"/state/ctr/quadlet.1.2.3.*.bak "$T/bak.before"; ls "$T"/state/ctr/quadlet.1.2.3.*.digest > "$T/dig.list"
@@ -1960,7 +1983,7 @@ ctr_fresh; printf '[Container]\nImage=ghcr.io/example/demo:v1.2.3 \r\n' > "$T/qu
 check "Image= with trailing space and CR: the guard does not refuse" bash -c "'$RR' update ctr 2>/dev/null && grep -q '^Image=ghcr.io/example/demo:v1.3.0\$' '$T/quadlet/demo.container'"
 ctr_fresh; printf '[Container]\nImage=ghcr.io/example/demo@sha256:%064d\n' 7 > "$T/quadlet/demo.container"; "$RR" adopt ctr 1.2.3 >/dev/null
 check "digest-only Image= (no tag): the guard does not refuse" bash -c "'$RR' update ctr 2>/dev/null && grep -q '^Image=ghcr.io/example/demo:v1.3.0\$' '$T/quadlet/demo.container'"
-echo "== container: how Image= is found and rewritten"
+section "container: how Image= is found and rewritten"
 Q="$T/quadlet/demo.container"
 q_img() { grep -qxF "$1" "$Q"; }
 ctr_fresh; rm -rf "$T/quadlet-real"; mkdir -p "$T/quadlet-real"; printf '[Container]\nImage=ghcr.io/example/demo:v1.2.3\n' > "$T/quadlet-real/demo.container"
@@ -2025,7 +2048,7 @@ check "set: both quadlets on the recorded version update" "$RR" update multi
 ctr_fresh; "$RR" update ctr >/dev/null 2>&1; rm -f "$T/state/ctr"/quadlet.*; "$RR" rollback ctr >/dev/null 2>&1
 check "after a manual rollback without backup the next update works" bash -c "rm -f '$T/state/ctr/skip'; '$RR' update ctr 2>/dev/null && grep -q ':v1.3.0\$' '$T/quadlet/demo.container'"
 
-echo "== state dir unwritable after the flip"
+section "state dir unwritable after the flip"
 if [[ "$(id -u)" == 0 ]]; then echo "  (skipping: root ignores directory modes)"; else
 reset_logs; web_install_old; web_recipe minor api-digest
 { cat "$T/etc/apps.d/web.conf"; echo "post_flip() { chmod 555 '$T/state/ws'; }"; } > "$T/etc/apps.d/ws.conf"
@@ -2047,7 +2070,7 @@ check "  logged and alerted" bash -c "grep -q 'event=state-write-failed' <<<\"\$
 rm -rf "$T/state/ws" "$T/state/ctrw" "$T/etc/apps.d/ws.conf" "$T/etc/apps.d/ctrw.conf"
 fi
 
-echo "== leftovers of a killed run, and a backup cut short"
+section "leftovers of a killed run, and a backup cut short"
 reset_logs; web_install_old; web_recipe minor api-digest
 mkdir -p "$T/state/web/work.x" "$T/www/demo-releases/1.0.0.relrotate-new"; echo asset > "$T/state/web/work.x/file"
 check "a dry run leaves stale work dirs alone" bash -c "'$RR' update -n web 2>/dev/null; test -e '$T/state/web/work.x/file' && test -d '$T/www/demo-releases/1.0.0.relrotate-new'"
@@ -2077,7 +2100,7 @@ check "  rollback installs it" bash -c "'$RR' rollback bin 2>/dev/null && test \
 rm -f "$T/bin/cp"
 fi
 
-echo "== constant tag: a failed update puts the tags a pull moved back"
+section "constant tag: a failed update puts the tags a pull moved back"
 cat > "$T/etc/apps.d/multil.conf" <<EOF
 SOURCE=github:example/demo
 POLICY=minor
@@ -2117,7 +2140,7 @@ multi_reset; touch "$T/fail-reload-once"; "$RR" update multi >/dev/null 2>&1 || 
 check "version tags: a failed daemon-reload logs no tag call" bash -c "! grep -q '^podman tag' '$T/log/podman'"
 rm -rf "$T/state/multil" "$T/etc/apps.d/multil.conf"
 
-echo "== SERVICE units: the update stops at the first failing restart, the revert tries every unit"
+section "SERVICE units: the update stops at the first failing restart, the revert tries every unit"
 reset_logs; web_install_old; web_recipe minor api-digest
 sed 's/^SERVICE=.*/SERVICE="a.service b.service"/' "$T/etc/apps.d/web.conf" > "$T/etc/apps.d/web2.conf"
 rm -rf "$T/state/web2"; "$RR" adopt web2 1.2.3 >/dev/null
@@ -2128,7 +2151,7 @@ check "  the failure is still reported" grep -q 'rolled back to 1.2.3; restart f
 check "  and the old version is live" test "$(readlink "$T/www/demo")" = "$T/www/demo-releases/1.2.3"
 rm -rf "$T/state/web2" "$T/etc/apps.d/web2.conf"
 
-echo "== signed checksum file"
+section "signed checksum file"
 printf '%s  a.tgz\n' "$(sha "$T/assets/demo-1.2.3.tar.gz")" > "$T/assets/SUMS"
 echo sig > "$T/assets/SUMS.asc"; : > "$T/kr.gpg"
 cat > "$T/sums-unit.sh" <<EOF
@@ -2152,7 +2175,7 @@ check "a relative keyring fails" bash -c "$(declare -f sums); T='$T'; ! sums KR=
 reset_logs
 check "without CHECKSUM_SIG_ASSET no signature is checked (control)" bash -c "$(declare -f sums); T='$T'; sums SIG= && test ! -e '$T/log/gpgv'"
 
-echo "== backup helpers"
+section "backup helpers"
 bk="$T/bk"
 backup_recipe() {   # hook-body [extra recipe lines]
     rm -rf "$bk"; reset_logs; web_install_old; web_recipe minor api-digest
@@ -2216,7 +2239,7 @@ check "a prerelease version is made safe in the file name" \
     bash -c "'$RR' update web 2>/dev/null; ls '$bk' | grep -qxE \"app-1\\.2\\.3_rc1-[0-9]{14}\\.sql\\.gz\""
 rm -rf "$bk"; web_recipe minor api-digest
 
-echo "== rootless quadlet: its owner's account does the file work"
+section "rootless quadlet: its owner's account does the file work"
 reset_logs; rm -rf "$T/state/rl"
 printf '[Container]\nImage=ghcr.io/example/demo:v1.2.3\nPublishPort=8080:8080\n' > "$T/quadlet/rl.container"
 chmod 600 "$T/quadlet/rl.container"
@@ -2251,7 +2274,7 @@ check "when the owner's account cannot read the quadlet, the version is unknown"
 mv "$T/bin/runuser.ok" "$T/bin/runuser"
 rm -f "$T/etc/apps.d/rl.conf" "$T/quadlet/rl.container"; rm -rf "$T/state/rl"
 
-echo "== adopt <app>: take over an existing install"
+section "adopt <app>: take over an existing install"
 reset_logs
 rm -rf "$T/ex" "$T/qd" "$T/upd" "$T/units" "$T/opt"
 mkdir -p "$T/ex" "$T/qd" "$T/upd/systemd" "$T/upd/cron.d" "$T/units" "$T/opt/sapp/releases/1.0.0/bin"
@@ -2298,6 +2321,21 @@ check "  the written recipe works: check finds the candidate" bash -c "'$RR' che
 cp "$T/etc/apps.d/capp.conf" "$T/capp.conf.before"
 check "adopt again: recipe unchanged, version already recorded" \
     bash -c "'$RR' adopt capp 2>&1 | grep -q 'already recorded' && cmp -s '$T/etc/apps.d/capp.conf' '$T/capp.conf.before'"
+# An old failed result, host and state agreeing: adopt replaces it (#128).
+S="$T/state/capp"; v="$(cat "$S/installed")"
+printf 'failed %s (health check failed)\n' "$v" > "$S/last-result"
+out="$(adopt_out capp)"
+check "adopt again after an old failure: the failed result is replaced" grep -q "^adopted $v " "$S/last-result"
+check "  adopt says so" has 'the earlier failed result is replaced'
+printf 'failed %s (x)\n' "$v" > "$S/last-result"; echo "$v" > "$S/unhealthy"
+out="$(adopt_out capp)"
+check "  not while unhealthy is set: result and mark stay" bash -c "grep -q '^failed' '$S/last-result' && test -s '$S/unhealthy'"
+check "    adopt names the way out" has "once it is fixed: relrotate adopt capp $v"
+rm -f "$S/unhealthy"; echo "$v" > "$S/incomplete"
+out="$(adopt_out capp)"
+check "  not after an incomplete rollback: still blocked, result kept" bash -c "grep -q '^failed' '$S/last-result' && test -s '$S/incomplete'"
+check "    adopt names both ways out" has "relrotate rollback capp, or once the files are checked: relrotate adopt capp $v"
+rm -f "$S/incomplete"
 # a quadlet on :latest
 printf '[Container]\nImage=ghcr.io/example/demo:latest\n' > "$T/qd/lapp.container"
 check "quadlet on :latest: recipe written, version unknown, exit 2" \
@@ -2396,7 +2434,7 @@ for a in capp lapp happ eapp sapp bapp npmplus; do rm -rf "$T/etc/apps.d/$a.conf
 rm -rf "$T/ex" "$T/qd" "$T/upd" "$T/units" "$T/opt" "$T"/*.conf.before "$T/releases-sapp.json" "$T/releases-bapp.json"
 unset RELROTATE_QUADLET_DIRS RELROTATE_UPDATER_DIRS
 
-echo "== date tags: VERSION_REGEX with groups v1..v4"
+section "date tags: VERSION_REGEX with groups v1..v4"
 reset_logs; rm -rf "$T/state/dt"
 printf '[Container]\nImage=docker.io/example/dt:2026-10-22-r1\n' > "$T/quadlet/dt.container"
 jq -n '["2026-11-18-r1", "2026-10-22-r2", "2026-10-22-r1", "2026-07-24-r1", "develop"]
@@ -2429,7 +2467,51 @@ check "without VERSION_REGEX a four-part tag is still not a version" \
     bash -c "out=\$(STUB_RELEASES='$T/releases-4.json' '$RR' check web 2>/dev/null) && grep -q '^newest' <<<\"\$out\" && ! grep -q '9\.9\.9\.9' <<<\"\$out\""
 rm -f "$T/etc/apps.d/dt.conf" "$T/quadlet/dt.container" "$T"/releases-dt*.json "$T/releases-4.json"; rm -rf "$T/state/dt"
 
-echo "== relrotate updates itself"
+section "a failed security release: maintenance page, not a rollback"
+jq 'map(if .tag_name == "v1.3.0" then .body = "This is a security update. Fixes CVE-2026-0001." else . end)' \
+    "$T/releases.json" > "$T/releases-sec.json"
+sec_recipe() { reset_logs; web_install_old; web_recipe minor api-digest; echo 'ON_SECURITY_FAILURE=maintenance' >> "$T/etc/apps.d/web.conf"; }
+sec_update() { STUB_RELEASES="$T/releases-sec.json" "$RR" update web 2>/dev/null; }
+sec_recipe; touch "$T/unhealthy"
+check "a security release that fails its health check: update exits 1" bash -c "$(declare -f sec_update); T='$T' RR='$RR'; ! sec_update"
+check "  TARGET is the maintenance page" \
+    test "$(readlink "$T/www/demo")" = "$T/www/demo-releases/.maintenance" -a -s "$T/www/demo-releases/.maintenance/index.html"
+check "  state: maintenance=1.3.0, installed still 1.2.3, nothing skipped" \
+    bash -c "[[ \$(cat '$T/state/web/maintenance') == 1.3.0 && \$(cat '$T/state/web/installed') == 1.2.3 && ! -e '$T/state/web/skip' ]]"
+check "  status shows MAINTENANCE(1.3.0)" bash -c "'$RR' status web | grep -q 'MAINTENANCE(1.3.0)'"
+check "  status --json has it" test "$("$RR" status --json web | jq -r '.[0].maintenance')" = 1.3.0
+check "  alert sent" grep -q 'MAINTENANCE: security release 1.3.0 failed' "$T/log/mail"
+check "  the service was restarted on the page" grep -q 'restart demo.service' "$T/log/systemctl"
+: > "$T/log/mail"
+check "a retry that fails again: still the page, no second alert" \
+    bash -c "$(declare -f sec_update); T='$T' RR='$RR'; ! sec_update && test \"\$(readlink '$T/www/demo')\" = '$T/www/demo-releases/.maintenance' && test ! -s '$T/log/mail'"
+rm -f "$T/unhealthy"
+check "a retry that passes installs 1.3.0 and clears maintenance" \
+    bash -c "$(declare -f sec_update); T='$T' RR='$RR'; sec_update && test \"\$(readlink '$T/www/demo')\" = '$T/www/demo-releases/1.3.0' && test ! -e '$T/state/web/maintenance' && test \"\$(cat '$T/state/web/installed')\" = 1.3.0"
+sec_recipe; touch "$T/unhealthy"; sec_update || true; rm -f "$T/unhealthy"
+check "rollback from maintenance: back on 1.2.3, 1.3.0 skipped, marker gone" \
+    bash -c "'$RR' rollback web >/dev/null 2>&1 && test \"\$(readlink '$T/www/demo')\" = '$T/www/demo-releases/1.2.3' && test \"\$(cat '$T/state/web/skip')\" = 1.3.0 && test \"\$(cat '$T/state/web/installed')\" = 1.2.3 && test ! -e '$T/state/web/maintenance'"
+sec_recipe; touch "$T/unhealthy"; sec_update || true
+cp "$T/assets/demo-1.3.0.tar.gz" "$T/assets/demo-1.3.1.tar.gz"
+jq 'map(if .tag_name == "v1.3.0" then .body = "This is a security update." else . end) + [.[] | select(.tag_name == "v1.3.0") | .tag_name = "v1.3.1" | .body = "Bug fixes" | .assets |= map(.name |= sub("1.3.0"; "1.3.1") | .browser_download_url |= sub("1.3.0"; "1.3.1"))]' \
+    "$T/releases.json" > "$T/releases-sec2.json"
+check "on the page, a newer non-security release that fails goes back to the page" \
+    bash -c "! STUB_RELEASES='$T/releases-sec2.json' '$RR' update web 2>/dev/null; test \"\$(readlink '$T/www/demo')\" = '$T/www/demo-releases/.maintenance' && test \"\$(cat '$T/state/web/installed')\" = 1.2.3"
+sec_recipe; touch "$T/unhealthy"
+check "a release without security notes still rolls back" \
+    bash -c "! '$RR' update web 2>/dev/null && test \"\$(readlink '$T/www/demo')\" = '$T/www/demo-releases/1.2.3' && test ! -e '$T/state/web/maintenance'"
+sec_recipe; echo 'ON_SECURITY_FAILURE=rollback' >> "$T/etc/apps.d/web.conf"; touch "$T/unhealthy"
+check "ON_SECURITY_FAILURE=rollback: a security release rolls back as before" \
+    bash -c "$(declare -f sec_update); T='$T' RR='$RR'; ! sec_update && test \"\$(readlink '$T/www/demo')\" = '$T/www/demo-releases/1.2.3' && test ! -e '$T/state/web/maintenance'"
+sec_recipe; sed -i 's/^LAYOUT=symlink/LAYOUT=binary/' "$T/etc/apps.d/web.conf"
+check "ON_SECURITY_FAILURE=maintenance needs LAYOUT=symlink (exit 2)" test "$(rc_of "$RR" check web)" = 2
+sec_recipe; echo 'ON_SECURITY_FAILURE=bogus' >> "$T/etc/apps.d/web.conf"
+check "ON_SECURITY_FAILURE=bogus: exit 2" test "$(rc_of "$RR" check web)" = 2
+sec_recipe; echo "SECURITY_REGEX='('" >> "$T/etc/apps.d/web.conf"
+check "an invalid SECURITY_REGEX: exit 2" test "$(rc_of "$RR" check web)" = 2
+reset_logs; web_install_old; web_recipe minor api-digest
+
+section "relrotate updates itself"
 # install.sh runs for real into scratch directories, and the installed copy
 # then updates itself from fake releases. gpgv is a stub here; the signature
 # check itself is covered by "signed checksum file" above and, with the real
@@ -2496,12 +2578,39 @@ check "rollback reinstalls the old version" bash -c "$(declare -f selfrr selfver
 check "  symlink is back" test "$(readlink "$P/pfx/lib/relrotate-current")" = "$P/pfx/lib/relrotate-releases/$cur"
 check "a release whose install.sh fails half-way fails the update" bash -c "$(declare -f selfrr); $(declare -p self_env); P='$P'; ! STUB_RELEASES='$P/rel-$broken.json' selfrr update relrotate 2>/dev/null"
 check "  and the old version is installed again" test "$(selfver)" = "$cur" -a "$(cat "$P/state/relrotate/installed")" = "$cur"
+# Old releases, as hand runs of install.sh leave them: the next update prunes
+# them down to KEEP (3), never the live or previous one.
+newer="${cur%.*}.101"; mkrel "$newer"
+mkdir -p "$P/pfx/lib/relrotate-releases/"{0.0.1,0.0.2,0.0.3}
+check "an update prunes old releases" bash -c "$(declare -f selfrr); $(declare -p self_env); P='$P'; STUB_RELEASES='$P/rel-$newer.json' selfrr update relrotate 2>/dev/null"
+check "  the three oldest are gone" bash -c "! ls -d '$P/pfx/lib/relrotate-releases/'0.0.[123] 2>/dev/null"
+check "  the live and the previous one stay" test -x "$P/pfx/lib/relrotate-releases/$newer/install.sh" -a -x "$P/pfx/lib/relrotate-releases/$cur/install.sh"
 
-# An RPM install: rpm says it owns the script, so setup takes the RPM recipe.
-printf '#!/bin/sh\nexit 0\n' > "$T/bin/rpm"; chmod +x "$T/bin/rpm"
+rm "$P/etc/apps.d/relrotate.conf"
+check "adopt relrotate on an install.sh install writes that recipe, with its PREFIX" \
+    bash -c "$(declare -f selfrr); $(declare -p self_env); P='$P'; selfrr adopt relrotate >/dev/null 2>&1; grep -qx 'TARGET=$P/pfx/lib/relrotate-current' '$P/etc/apps.d/relrotate.conf'"
+
+check "adopt relrotate from a checkout writes no recipe (exit 2)" \
+    bash -c "test \"\$(env -u RELROTATE_EXAMPLES_DIR '$RR' adopt relrotate >/dev/null 2>&1; echo \$?)\" = 2 && test ! -e '$T/etc/apps.d/relrotate.conf'"
+# An RPM install: rpm says it owns the script, so setup and adopt take the
+# RPM recipe; rpm -q --qf answers 4.5.6.
+printf '#!/bin/sh\ncase "$*" in *--qf*) printf 4.5.6 ;; esac\nexit 0\n' > "$T/bin/rpm"; chmod +x "$T/bin/rpm"
 check "setup on an RPM install writes the RPM recipe" bash -c "printf 'y\n' | env -u RELROTATE_EXAMPLES_DIR '$RR' setup >/dev/null 2>&1 && cmp -s '$here/../examples/apps.d/relrotate-rpm.conf' '$T/etc/apps.d/relrotate.conf'"
+rm -f "$T/etc/apps.d/relrotate.conf"; rm -rf "$T/state/relrotate"
+check "adopt relrotate on an RPM install writes the RPM recipe" \
+    bash -c "env -u RELROTATE_EXAMPLES_DIR '$RR' adopt relrotate >/dev/null 2>&1; cmp -s '$here/../examples/apps.d/relrotate-rpm.conf' '$T/etc/apps.d/relrotate.conf'"
+check "  and records the version rpm reports" test "$(cat "$T/state/relrotate/installed" 2>/dev/null)" = 4.5.6
 rm -f "$T/bin/rpm" "$T/bin/gpgv" "$T/etc/apps.d/relrotate.conf"; rm -rf "$P" "$T/state/relrotate"
 
+section_end
+echo
+echo "slowest sections:"
+printf '%s\n' "${timings[@]}" | sort -rn | head -n 10
+if (( fail )); then
+    echo
+    echo "failed:"
+    printf '  %s\n' "${failed[@]}"
+fi
 echo
 echo "passed: $pass  failed: $fail"
 (( fail == 0 ))

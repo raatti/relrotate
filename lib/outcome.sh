@@ -122,6 +122,21 @@ outcome_update_reverted() {
     esac
 }
 
+# outcome_maintenance REASON PAGE_RC: a security release failed after the
+# flip and was not reverted (#131). installed stays OLD_VERSION and nothing
+# is skipped: every timer run tries VERSION again; a pass clears the marker.
+outcome_maintenance() {
+    local reason="$1" page="the maintenance page is up"
+    (( $2 == 0 )) || page="the maintenance page could NOT be put up, so $VERSION is still live"
+    state_set_alert maintenance "$VERSION" "$VERSION or the maintenance page" || return 0
+    # A symlink app may have no recorded version (it is read from the link,
+    # which now names the page): record it, for the retry and for rollback.
+    state_set_alert installed "$OLD_VERSION" "the maintenance page" || return 0
+    commit_result "failed $VERSION ($reason): security release, MAINTENANCE instead of $OLD_VERSION; $page; retried on every timer run"
+    notify_once maintenance "MAINTENANCE: security release $VERSION failed" \
+        "relrotate updated $APP to $VERSION, a security release, and it failed: $reason. It was not rolled back to $OLD_VERSION, which that release fixes: $page. Every timer run tries $VERSION again, and the app is back once it passes. Fix the cause, or wait for a newer release. To serve $OLD_VERSION anyway: relrotate rollback $APP (it skips $VERSION)."
+}
+
 # Manual rollback from VERSION (installed) to OLD_VERSION (previous), after
 # revert_to OLD_VERSION. Once the files are on OLD_VERSION the state says so,
 # even when the restart or health check then fails. Returns the exit status
@@ -163,16 +178,17 @@ outcome_rollback() {
     [[ "$cur" == unknown || "$prev" == "$cur" ]] || moved=1
     # Skip first, so a crash after "installed" never leaves the timer free to
     # reinstall the version we rolled away from; a newer release clears it.
-    if (( moved )); then state_set skip "$cur"; fi
+    # --no-skip (a test rollback) leaves it free on purpose.
+    if (( moved && ! ${NO_SKIP:-0} )); then state_set skip "$cur"; fi
     state_set installed "$prev"
     if (( moved )); then state_set previous "$cur"; fi
     # Last: a crash before this leaves updates blocked, never unblocked
     # with installed still naming the version we rolled away from.
-    state_clear incomplete failed-notified
+    state_clear incomplete failed-notified maintenance
     # prev == cur: finishing an automatic rollback that was left incomplete.
-    local what="manual rollback $cur -> $prev" skipped="; $cur will be skipped until a newer release appears"
+    local what="manual rollback $cur -> $prev" skipped="; $cur will be skipped until a newer release appears (relrotate unskip $APP clears that)"
     [[ "$prev" != "$cur" ]] || { what="finished rollback to $prev"; skipped=""; }
-    [[ "$cur" != unknown ]] || skipped=""
+    [[ "$cur" != unknown ]] && (( ! ${NO_SKIP:-0} )) || skipped=""
     set_health "$prev"
     case "$REVERT_CASE" in
     clean)

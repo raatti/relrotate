@@ -62,6 +62,25 @@ layout_symlink_stage() {
 
 layout_symlink_doctor() { doctor_target_dir; }
 
+# maintenance_page_up: point TARGET at RELEASES_DIR/.maintenance, a page
+# saying a manual update is needed (ON_SECURITY_FAILURE=maintenance, #131).
+# Not a version name, so prune never touches it.
+maintenance_page_up() {
+    local dir="$RELEASES_DIR/.maintenance"
+    mkdir -p "$dir" || return 1
+    cat > "$dir/index.html" <<'EOF' || return 1
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Down for maintenance</title></head>
+<body><h1>Down for maintenance</h1>
+<p>A security update needs manual attention. This service is back as soon as
+an administrator has finished it.</p></body></html>
+EOF
+    chmod 0755 "$dir" && chmod 0644 "$dir/index.html" || return 1
+    if [[ -n "$OWNER" ]]; then chown -R --no-dereference "$OWNER" "$dir" || return 1; fi
+    relabel "$dir"
+    flip_symlink "$dir"
+}
+
 layout_symlink_flip() { flip_symlink "$RELEASES_DIR/$VERSION"; }
 
 layout_symlink_revert() {

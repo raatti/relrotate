@@ -40,7 +40,9 @@ stubbed tests. In the pull request, show:
 
 - the OS and host type you ran it on;
 - a real `relrotate update <app>` run and a real `relrotate rollback <app>`
-  run for that app;
+  run for that app. Use `relrotate rollback --no-skip <app>`, or run
+  `relrotate unskip <app>` afterwards: a plain rollback skips the newest
+  release until a newer one appears;
 - the relevant log lines from both;
 - no secrets: remove tokens, hostnames you do not want public and mail
   addresses.

@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.4.3 (2026-11-28)
+
+- Example recipes for ollama (symlink layout for its binary and library
+  tree, with the one-time move of an `install.sh` install) and forgejo-mcp
+  (container, releases and images on a self-hosted Forgejo).
+
+- `ON_SECURITY_FAILURE=maintenance` (symlink layout): a security release
+  (its notes match `SECURITY_REGEX`) that fails after the flip is not
+  rolled back to the vulnerable version. A maintenance page goes up,
+  `status` shows `MAINTENANCE(<version>)`, and every timer run retries.
+  The web-app examples (Roundcube, FreshRSS, element-web, cinny, Adminer)
+  set it (#131).
+
+- `relrotate unskip <app>` clears the skip a manual rollback writes, and
+  `relrotate rollback --no-skip <app>` goes back without writing it. The
+  help, the rollback message, README and CONTRIBUTING say that a rollback
+  skips the version it leaves (#130).
+
+- New example recipes: gitleaks and fabric (danielmiessler/fabric), single
+  binaries from a tarball. Their asset names use their own arch words
+  (`x64`, `x86_64`), so each recipe maps `uname -m` itself.
+- `relrotate adopt relrotate` on an RPM install wrote the `install.sh`
+  recipe and could not read the version. It now picks the recipe for the
+  kind of install, as `relrotate setup` does, and from a git checkout it
+  writes none (exit 2) (#127).
+- `status` kept showing a failure that `adopt` had resolved. `adopt <app>
+  <ver>` now records "adopted <ver> by hand" as the last result and clears
+  the failure marks. `adopt <app>` with the version already recorded
+  replaces an earlier failed result, but leaves an `unhealthy`,
+  `incomplete` or `maintenance` mark alone and says how to clear it (#128).
+
 ## 0.4.2 (2026-11-21)
 
 - Every command exited 1 without a message on a host with no MTA

@@ -138,6 +138,10 @@ notifications work as for any other. Needs `gpgv` (package `gnupg2`).
   each RPM it installed, so a rollback has the previous one; the version you
   installed by hand before the first update is not kept, so that first
   update cannot be rolled back automatically.
+- **Old versions:** as for every app, each update keeps the newest `KEEP`
+  (default 3) and deletes the rest, never the live or previous one: the
+  release directories of an `install.sh` install, the kept RPMs under
+  `/var/lib/relrotate/relrotate/bin/` of an RPM install.
 - **Unit files:** every update installs the shipped `relrotate@.service` and
   `relrotate-digest.service` again. Keep local changes in drop-ins
   (`systemctl edit`), not in the files.
@@ -203,6 +207,13 @@ sudo relrotate adopt --source github:owner/repo myapp       # no example: say wh
 - **Version.** The installed version is read and recorded. When it cannot be
   read (a binary without `current_version`, a quadlet on `:latest`, a web
   root that is still a plain directory) `adopt` says what to do and exits 2.
+  When the version is already recorded, a failed last result from before is
+  replaced with "adopted <version>", so `status` stops showing it. An
+  `unhealthy`, `incomplete` or `maintenance` mark stays: a version read from
+  the host does not vouch for those; `relrotate adopt <app> <ver>` does.
+- **relrotate itself** gets the recipe `relrotate setup` would write: the RPM
+  one on an RPM install, the install.sh one otherwise; none from a git
+  checkout (exit 2).
 - **Old updaters.** Timers, update services and cron files that mention the
   app, and `AutoUpdate=` in the quadlet, are listed with the command to turn
   them off. `adopt` does not turn them off.
@@ -221,8 +232,14 @@ relrotate update -n <app>      dry run: download and verify only; no state
 relrotate rollback <app>       back to the previous version; skips the
                                rolled-back version until a newer one appears;
                                retries a rollback left incomplete
+relrotate rollback --no-skip <app>
+                               the same, without the skip (a test rollback)
+relrotate unskip <app>         clear that skip: the next update may install
+                               the version again
 relrotate adopt <app> <ver>    record the installed version (clears an
-                               incomplete-rollback block)
+                               incomplete-rollback block, an unhealthy or
+                               maintenance mark; last result: "adopted <ver>
+                               by hand")
 relrotate adopt <app>          take over an install that is already there:
                                see "Taking over an existing install"
 relrotate hold <app> [reason]  no updates until unhold (rollback and adopt
@@ -246,12 +263,14 @@ relrotate list | update-all
 ```
 
 `status` shows flags before `last=`: `INCOMPLETE(...)`, `UNHEALTHY(v)`,
+`MAINTENANCE(v)` (a failed security release, see below),
 `HELD(reason)`, `CHECK-FAILED` (the last release check failed; `last-check`
-is the time of the last good one), `SKIP(v)` and `WAITING(v until date)`.
+is the time of the last good one), `SKIP(v)` (a manual rollback left v;
+`relrotate unskip <app>` clears it) and `WAITING(v until date)`.
 `status --json` prints one array with the same fields (`null` when unset).
 
 Unknown options and extra arguments are an error (exit 2, with the usage);
-`-n` is refused for `adopt`, `rollback`, `hold`, `unhold`, `enable`, `disable`, `setup` and `digest`. `relrotate` with no command
+`-n` is refused for `adopt`, `rollback`, `unskip`, `hold`, `unhold`, `enable`, `disable`, `setup` and `digest`. `relrotate` with no command
 prints the usage and exits 2. App names start with a letter or digit.
 
 ## Recipe reference
@@ -290,6 +309,8 @@ single quotes so relrotate expands them, not the shell.
 | `HEALTH_URL` | | checked with curl; else `healthcheck()`; else `is-active` |
 | `BACKUP_DIR`, `BACKUP_KEEP` | state dir`/backups`, 5 | where the backup helpers write, and how many backups per name they keep |
 | `HEALTH_RETRIES`, `HEALTH_DELAY` | 5, 3 | retries (1 or more) and the pause between them (`sleep` syntax: `3`, `2.5`, `30s`, `1m`); validated |
+| `ON_SECURITY_FAILURE` | `rollback` | `maintenance` (symlink layout only): a security release that fails after the flip is not rolled back; see "A security release that fails" |
+| `SECURITY_REGEX` | `(?i)\bsecurity\b\|CVE-[0-9]{4}-[0-9]+` | jq regex on the release notes that marks a release as a security release |
 
 Global settings (`/etc/relrotate/relrotate.conf`): `GITHUB_TOKEN_FILE` and
 `GITEA_TOKEN_FILE` hold API tokens. A token is never sent over `http://`,
@@ -368,6 +389,28 @@ check passes, relrotate records "healthy again" and mails once. A
 successful update or rollback, or `adopt`, clears the mark. A rollback whose
 health check passes but whose hook failed is reported "with problems".
 
+### A security release that fails
+
+Rolling a failed security release back puts the vulnerable version in
+front of users again, and the next timer run tries the same release
+again. For client-facing apps, set `ON_SECURITY_FAILURE=maintenance` (the
+shipped web-app examples do). A release whose notes match `SECURITY_REGEX`
+and that fails after the flip (`post_flip`, restart or health check) is
+then not reverted:
+
+- `TARGET` points at `RELEASES_DIR/.maintenance/`, whose `index.html` says
+  the service is down for maintenance, and the service is restarted.
+- The state keeps the old version as installed, nothing is skipped, and
+  `status` shows `MAINTENANCE(<version>)`; one alert per version.
+- Every timer run tries the release again. Once it passes (you fixed the
+  config, or a newer release arrived), the app is back and the mark clears.
+- `relrotate rollback <app>` serves the old version anyway and skips the
+  failed release; `adopt` clears the mark after a fix by hand.
+
+The web server must serve `index.html` from the directory for the page to
+show; other paths get its 404. A release that fails before the flip
+(download, verification) changes nothing and is retried as always.
+
 A container rollback can be left incomplete: some quadlets were put back,
 then a copy or `daemon-reload` failed. relrotate then keeps the recorded
 versions as they were, writes the target version to `incomplete` in the
@@ -390,11 +433,14 @@ In `examples/apps.d/`, each checked against the project's real releases:
 | hugo | binary | binary inside a tarball (`ARCHIVE_MEMBER`), 0.x with `major` |
 | restic | binary | single `.bz2` file, `SHA256SUMS` |
 | rclone | binary | zip with a top directory |
+| gitleaks | binary | tarball whose asset names use their own arch words (`x64`), mapped in the recipe |
+| fabric | binary | asset names without a version, `Linux_x86_64` arch |
 | element-web | symlink | GPG signature, config copied into each release |
 | cinny | symlink | GPG signature |
 | freshrss | symlink | no release assets (`@tarball`), data dirs linked in |
 | roundcube | symlink | upstream migration script before the flip |
 | adminer | symlink | single PHP file renamed to index.php |
+| ollama | symlink | `.tar.zst` release tree (binary + libraries), `checksums-file` with `./` names, 0.x with `major`, version-checking health hook |
 | tuwunel | container | rootless quadlet (`QUADLET_USER`) |
 | vaultwarden | container | tag without `v`, SQLite backup |
 | npmplus | container | date tags (`2026-11-18-r1`) through `VERSION_REGEX` |
@@ -404,6 +450,7 @@ In `examples/apps.d/`, each checked against the project's real releases:
 | authelia | container | patch-only for an auth gateway |
 | lldap | container | image tag keeps the `v` (`${TAG}`) |
 | uptime-kuma | container | plain tags |
+| forgejo-mcp | container | releases and images on a self-hosted Forgejo (`gitea:` source, its own registry) |
 | immich | container | two containers as one set, database dump first |
 
 Paths, ports and hostnames in them are examples; adjust to your host.

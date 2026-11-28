@@ -8,7 +8,10 @@
 # Usage: relrotate <command> [app] [options]
 #   check   <app>          show installed / candidate version, change nothing
 #   update  <app>          update if policy allows (what the timer runs)
-#   rollback <app>         go back to the previous installed version
+#   rollback <app>         go back to the previous installed version; the
+#                          version left is skipped until a newer release
+#                          (--no-skip: don't; unskip clears it later)
+#   unskip  <app>          let updates install the skipped version again
 #   adopt   <app> [ver]    record the installed version; without ver: take over
 #                          an existing install (writes the recipe if there is
 #                          none, from the shipped example or --source)
@@ -26,13 +29,14 @@
 #   -n, --dry-run          download and verify, but do not install or flip
 #   --json                 status: one JSON array
 #   --source <kind:spec>   adopt: where releases are, e.g. github:owner/repo
+#   --no-skip              rollback: do not skip the version left
 #   -v, --verbose          debug logging
 #   -h, --help
 
 set -Eeuo pipefail
 shopt -s nullglob
 
-RELROTATE_VERSION="0.4.2"
+RELROTATE_VERSION="0.4.3"
 
 # Locations (overridable for tests and non-standard installs)
 LIB_DIR="${RELROTATE_LIB_DIR:-}"
@@ -105,6 +109,7 @@ load_recipe() {
     QUADLET="" QUADLET_USER="" IMAGE="" CONTAINERS=() PIN_DIGEST="no" CHECKSUM_SIG_ASSET=""
     BACKUP_DIR="" BACKUP_KEEP="5"
     SERVICE="" RESTART="yes" HEALTH_URL="" HEALTH_RETRIES="5" HEALTH_DELAY="3"
+    ON_SECURITY_FAILURE="rollback" SECURITY_REGEX='(?i)\bsecurity\b|CVE-[0-9]{4}-[0-9]+'
     LINKS=() COPY=()
     unset -f pre_update post_extract post_flip healthcheck on_rollback current_version 2>/dev/null || true
 
@@ -126,6 +131,12 @@ load_recipe() {
     [[ "$BACKUP_KEEP" =~ ^[1-9][0-9]*$ ]] || die 2 "$APP: BACKUP_KEEP must be a whole number, 1 or more"
     [[ -z "$BACKUP_DIR" || "$BACKUP_DIR" == /* ]] || die 2 "$APP: BACKUP_DIR must be an absolute path"
     layout_known || die 2 "$APP: LAYOUT must be symlink|binary|container"
+    case "$ON_SECURITY_FAILURE" in
+        rollback) ;;
+        maintenance) [[ "$LAYOUT" == symlink ]] || die 2 "$APP: ON_SECURITY_FAILURE=maintenance needs LAYOUT=symlink" ;;
+        *) die 2 "$APP: ON_SECURITY_FAILURE must be rollback|maintenance" ;;
+    esac
+    jq -n --arg r "$SECURITY_REGEX" '"" | test($r)' >/dev/null 2>&1 || die 2 "$APP: SECURITY_REGEX is not a valid regex: $SECURITY_REGEX"
     layout validate
     ARCH="$(detect_arch)"
     return 0
@@ -223,7 +234,18 @@ cmd_rollback() {
         cur="$(clean_version "$(state_get installed)")" || cur=""
     }
     # An incomplete revert is retried first, towards the version it was going to.
-    prev="$(state_blocked)" || prev="$(state_get previous)"
+    if ! prev="$(state_blocked)"; then
+        local mnt; mnt="$(state_get maintenance)"
+        if [[ -n "$mnt" ]]; then
+            # The maintenance page is up for a failed security release: back
+            # to the recorded version, which skips the release (#131).
+            [[ -n "$cur" ]] || die 1 "$APP: no installed version recorded"
+            VERSION="$mnt" OLD_VERSION="$cur"
+            transaction_rollback
+            return
+        fi
+        prev="$(state_get previous)"
+    fi
     [[ -n "$prev" ]] || die 1 "$APP: no previous version recorded"
     VERSION="$cur" OLD_VERSION="$prev"
     transaction_rollback
@@ -236,10 +258,18 @@ cmd_adopt() {
     [[ -n "$ver" ]] || die 2 "usage: relrotate adopt <app> <version>"
     ver="${ver#"$TAG_PREFIX"}"
     ver="$(clean_version "$ver")" || die 2 "$APP: not a version: $2"
-    state_set installed "$ver"
-    state_clear incomplete unhealthy failed-notified   # the admin vouches for the files now
-    log info event=adopted version="$ver"
+    adopt_record "$ver"
     echo "$APP: recorded installed version $ver"
+}
+
+# adopt_record VERSION: both adopt forms. The admin vouches for the files
+# now, so a past failure is history: its markers go, and the last result
+# says what happened instead of the failure.
+adopt_record() {
+    state_set installed "$1"
+    state_clear incomplete unhealthy failed-notified maintenance
+    state_set last-result "adopted $1 by hand ($(date -Is))"
+    log info event=adopted version="$1"
 }
 
 # hold APP [REASON]: no updates until unhold. Rollback and adopt still work.
@@ -259,6 +289,18 @@ cmd_unhold() {
     state_clear held
     log info event=unhold
     echo "$APP: updates run again"
+}
+
+# unskip APP: clear the skip a manual rollback wrote, so updates may
+# install that version again.
+cmd_unskip() {
+    load_recipe "$1"
+    acquire_lock
+    local v; v="$(state_get skip)"
+    [[ -n "$v" ]] || { echo "$APP: nothing skipped"; return 0; }
+    state_clear skip
+    log info event=unskipped version="$v"
+    echo "$APP: $v is no longer skipped; the next update may install it"
 }
 
 # enable|disable APP: the app's timer, so nobody has to type the unit name.
@@ -283,26 +325,40 @@ cmd_setup() {
 
 # Offer to keep relrotate itself up to date: the shipped recipe for this
 # kind of install, as apps.d/relrotate.conf, and its timer.
-setup_self_update() {
-    local recipe="$CONF_DIR/apps.d/relrotate.conf" self prefix ex a
-    if [[ -e "$recipe" ]]; then echo "relrotate updates itself: $recipe"; return 0; fi
+# self_example: set SELF_EXAMPLE to the shipped recipe for relrotate itself
+# on this kind of install (RPM, or install.sh of 0.4.2 or newer) and
+# SELF_PREFIX to its PREFIX. Prints why and fails when there is none.
+# setup and adopt both use it.
+self_example() {
+    local self
     self="$(readlink -f "${BASH_SOURCE[0]}")"
-    prefix="$(dirname "$(dirname "$self")")"
+    SELF_PREFIX="$(dirname "$(dirname "$self")")"
     if command -v rpm >/dev/null 2>&1 && rpm -qf "$self" >/dev/null 2>&1; then
-        ex="$EXAMPLES_DIR/relrotate-rpm.conf"
-    elif [[ -L "$prefix/lib/relrotate-current" && "$prefix" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
-        ex="$EXAMPLES_DIR/relrotate.conf"   # install.sh, 0.4.2 or newer
+        SELF_EXAMPLE="$EXAMPLES_DIR/relrotate-rpm.conf"
+    elif [[ -L "$SELF_PREFIX/lib/relrotate-current" && "$SELF_PREFIX" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+        SELF_EXAMPLE="$EXAMPLES_DIR/relrotate.conf"
     else
         echo "self-update is not offered: it needs an RPM install, or install.sh of 0.4.2 or newer"
-        return 0
+        return 1
     fi
-    if [[ -z "$EXAMPLES_DIR" || ! -r "$ex" ]]; then
-        echo "self-update is not offered: the example recipe ${ex##*/} is missing"; return 0
+    if [[ -z "$EXAMPLES_DIR" || ! -r "$SELF_EXAMPLE" ]]; then
+        echo "self-update is not offered: the example recipe ${SELF_EXAMPLE##*/} is missing"; return 1
     fi
+}
+
+# write_self_recipe FILE: the example names /usr/local; an install.sh
+# PREFIX goes in its place. Call self_example first.
+write_self_recipe() {
+    ( umask 027; sed "s|/usr/local|$SELF_PREFIX|g" "$SELF_EXAMPLE" > "$1" ) || die 1 "cannot write $1"
+}
+
+setup_self_update() {
+    local recipe="$CONF_DIR/apps.d/relrotate.conf" a
+    if [[ -e "$recipe" ]]; then echo "relrotate updates itself: $recipe"; return 0; fi
+    self_example || return 0
     read -r -p "Update relrotate itself automatically from its GitHub releases? [y/N] " a || a=""
     [[ "$a" == [yY]* ]] || return 0
-    # The example names /usr/local; an install.sh PREFIX goes in its place.
-    ( umask 027; sed "s|/usr/local|$prefix|g" "$ex" > "$recipe" ) || die 1 "cannot write $recipe"
+    write_self_recipe "$recipe"
     echo "wrote $recipe"
     cmd_timer enable relrotate
 }
@@ -345,13 +401,13 @@ setup_notifications() {
 status_json() {
     local STATE_DIR="$STATE_ROOT/$1" f
     local -a args=(--arg app "$1")
-    for f in installed previous last-check last-result incomplete unhealthy held skip check-failed waiting; do
+    for f in installed previous last-check last-result incomplete maintenance unhealthy held skip check-failed waiting; do
         if state_has "$f"; then args+=(--arg "${f//-/_}" "$(state_get "$f")")
         else args+=(--argjson "${f//-/_}" null); fi
     done
     jq -nc "${args[@]}" '{app: $app, installed: $installed, previous: $previous,
         last_check: $last_check, last_result: $last_result, incomplete: $incomplete,
-        unhealthy: $unhealthy, held: $held, skip: $skip, check_failed: $check_failed,
+        maintenance: $maintenance, unhealthy: $unhealthy, held: $held, skip: $skip, check_failed: $check_failed,
         waiting: $waiting}'
 }
 
@@ -371,6 +427,7 @@ cmd_status() {
         status_json "$a" | jq -r '
             def v: . // "-";
             ([ (select(.incomplete) | "INCOMPLETE(rollback to \(.incomplete))"),
+               (select(.maintenance) | "MAINTENANCE(\(.maintenance))"),
                (select(.unhealthy) | "UNHEALTHY(\(.unhealthy))"),
                (select(.held) | "HELD(\(.held))"),
                (select(.check_failed) | "CHECK-FAILED"),
@@ -571,13 +628,14 @@ cmd_update_all() {
 
 usage_err() { log err msg="$1"; usage >&2; exit 2; }
 
-DRY_RUN=0 JSON=0 SOURCE_OPT=""
+DRY_RUN=0 JSON=0 SOURCE_OPT="" NO_SKIP=0
 args=()
 while (( $# )); do
     case "$1" in
         -n|--dry-run) DRY_RUN=1 ;;
         -v|--verbose) RELROTATE_DEBUG=1 ;;
         --json) JSON=1 ;;
+        --no-skip) NO_SKIP=1 ;;
         --source)
             [[ $# -ge 2 && "$2" =~ ^(github:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+|(gitea|forgejo):https?://[A-Za-z0-9._:/-]+)$ ]] \
                 || usage_err "--source takes github:owner/repo or gitea:https://host/owner/repo"
@@ -597,14 +655,16 @@ require_tools
 cmd="${1:-}"; shift || true
 # -n would be silently ignored here, and these commands write state.
 case "$cmd" in
-    adopt|rollback|hold|unhold|enable|disable|setup|digest) (( ! DRY_RUN )) || usage_err "$cmd has no --dry-run" ;;
+    adopt|rollback|unskip|hold|unhold|enable|disable|setup|digest) (( ! DRY_RUN )) || usage_err "$cmd has no --dry-run" ;;
 esac
 [[ "$cmd" == status ]] || (( ! JSON )) || usage_err "--json is for status only"
 [[ "$cmd" == adopt || -z "$SOURCE_OPT" ]] || usage_err "--source is for adopt only"
+[[ "$cmd" == rollback ]] || (( ! NO_SKIP )) || usage_err "--no-skip is for rollback only"
 case "$cmd" in
     check)      [[ $# -eq 1 ]] || usage_err "usage: relrotate check <app>"; cmd_check "$1" ;;
     update)     [[ $# -eq 1 ]] || usage_err "usage: relrotate update <app>"; cmd_update "$1" ;;
-    rollback)   [[ $# -eq 1 ]] || usage_err "usage: relrotate rollback <app>"; cmd_rollback "$1" ;;
+    rollback)   [[ $# -eq 1 ]] || usage_err "usage: relrotate rollback [--no-skip] <app>"; cmd_rollback "$1" ;;
+    unskip)     [[ $# -eq 1 ]] || usage_err "usage: relrotate unskip <app>"; cmd_unskip "$1" ;;
     adopt)      [[ $# -ge 1 && $# -le 2 ]] || usage_err "usage: relrotate adopt [--source kind:spec] <app> [version]"
                 if [[ $# -eq 2 ]]; then
                     [[ -z "$SOURCE_OPT" ]] || usage_err "--source is for adopt without a version"

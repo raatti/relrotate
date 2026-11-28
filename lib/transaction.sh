@@ -67,6 +67,24 @@ revert_update() {
     return 1
 }
 
+# Failure after the flip (post_flip, restart, health check). A security
+# release of a recipe with ON_SECURITY_FAILURE=maintenance is not reverted
+# to the version it fixes: the maintenance page goes up instead (#131).
+# While the page is up, any release that fails goes back to it: reverting
+# would serve the version the security release fixed. Returns 1.
+fail_after_flip() {
+    local reason="$1" page_rc=0
+    if [[ "$ON_SECURITY_FAILURE" != maintenance ]] \
+        || ! { state_has maintenance || release_is_security "$VERSION"; }; then
+        revert_update "$reason"; return 1
+    fi
+    log err event=maintenance reason="$reason" version="$VERSION" instead_of="$OLD_VERSION"
+    maintenance_page_up || page_rc=1
+    if (( ! page_rc )); then restart_service all || log err msg="restart failed with the maintenance page up"; fi
+    outcome_maintenance "$reason" "$page_rc"
+    return 1
+}
+
 # TERM/INT (systemctl stop, TimeoutStartSec) during an update or rollback.
 # TXN_PHASE: pre (nothing changed yet), switched (files may be between
 # OLD_VERSION and VERSION), done (the outcome is recorded). Writing
@@ -134,14 +152,14 @@ transaction_apply() {
     esac
     # --- past the flip: every failure reverts ---
     run_hook post_flip
-    (( HOOK_RC == 0 )) || { revert_update "post_flip hook failed"; return 1; }
-    restart_service || { revert_update "restart failed"; return 1; }
+    (( HOOK_RC == 0 )) || { fail_after_flip "post_flip hook failed"; return 1; }
+    restart_service || { fail_after_flip "restart failed"; return 1; }
     run_healthcheck
-    (( HEALTHY )) || { revert_update "health check failed"; return 1; }
+    (( HEALTHY )) || { fail_after_flip "health check failed"; return 1; }
 
     state_set_alert previous "$OLD_VERSION" "$VERSION" || return 1
     state_set_alert installed "$VERSION" "$VERSION" || return 1
-    state_clear unhealthy failed-notified
+    state_clear unhealthy failed-notified maintenance
     commit_result "updated $OLD_VERSION -> $VERSION"
     layout prune
     log info event=updated from="$OLD_VERSION" to="$VERSION"

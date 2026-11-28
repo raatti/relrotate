@@ -118,7 +118,7 @@ fetch_releases() {
     # trailing newline cannot pass.
     local parsed n
     parsed="$(jq -c --arg prefix "$TAG_PREFIX" --arg re "$VERSION_REGEX" \
-        --arg pre "$ALLOW_PRERELEASE" "$JQ_TAG_VERSION"'
+        --arg pre "$ALLOW_PRERELEASE" --arg sre "${SECURITY_REGEX:-}" "$JQ_TAG_VERSION"'
         [ .[]
           | select(.draft != true)
           | select($pre == "yes" or .prerelease != true)
@@ -132,6 +132,7 @@ fetch_releases() {
           | select($v | sub("-.*"; "") | test("[0-9]{10}") | not)
           | { tag: $tag, version: $v, prerelease: (.prerelease // false),
               published: (.published_at // .created_at // null),
+              security: ($sre != "" and ((.body // "") | test($sre))),
               tarball: (.tarball_url // null),
               assets: [ (.assets // [])[]
                         | { name, url: .browser_download_url, digest: (.digest // null) } ] }
@@ -216,6 +217,11 @@ old_enough() {
         return 1
     fi
     (( $(date +%s) >= $(date -d "$ripe" +%s) ))
+}
+
+# release_is_security VERSION: its release notes match SECURITY_REGEX.
+release_is_security() {
+    [[ "$(jq -r --arg v "$1" 'first(.[] | select(.version == $v) | .security) // false' <<<"$RELEASES")" == true ]]
 }
 
 # A newer release than the skipped one clears the skip marker. Update only:

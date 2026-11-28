@@ -130,7 +130,14 @@ adopt_guess_asset() {
 adopt_write_recipe() {
     local recipe="$1" new="$1.new" ex="$EXAMPLES_DIR/$APP.conf" from_example=0 q exe link img
     rm -f -- "$new"
-    if [[ -n "$EXAMPLES_DIR" && -r "$ex" ]]; then
+    if [[ "$APP" == relrotate ]]; then
+        # Its recipe depends on how relrotate was installed, as in setup.
+        self_example >&2 || die 2 "relrotate: no recipe for this kind of install; write $recipe by hand"
+        write_self_recipe "$new"
+        from_example=1
+        [[ -z "$SOURCE_OPT" ]] || file_set "$new" SOURCE "$SOURCE_OPT"
+        echo "$APP: recipe starts from the shipped example ${SELF_EXAMPLE##*/}"
+    elif [[ -n "$EXAMPLES_DIR" && -r "$ex" ]]; then
         cp -- "$ex" "$new" || die 1 "cannot write $new"
         from_example=1
         [[ -z "$SOURCE_OPT" ]] || file_set "$new" SOURCE "$SOURCE_OPT"
@@ -256,12 +263,26 @@ EOF
         fi
         exit 2
     fi
-    if state_has installed; then
-        echo "$APP: installed version $ver (already recorded)"
-    else
-        state_set installed "$ver"
-        log info event=adopted version="$ver"
+    if ! state_has installed; then
+        adopt_record "$ver"
         echo "$APP: recorded installed version $ver"
+    else
+        echo "$APP: installed version $ver (already recorded)"
+        # A version read from the host does not vouch for files a partial
+        # rollback may have mixed, or for a live version that fails its health
+        # check: those marks stay, and only the explicit form clears them.
+        if state_has incomplete; then
+            echo "$APP: updates are blocked by an incomplete rollback: relrotate rollback $APP, or once the files are checked: relrotate adopt $APP $ver"
+        elif state_has maintenance; then
+            echo "$APP: the maintenance page is up for $(state_get maintenance); the next update retries it, or: relrotate rollback $APP"
+        elif state_has unhealthy; then
+            echo "$APP: $ver is marked unhealthy and checked again on every run; once it is fixed: relrotate adopt $APP $ver"
+        elif [[ "$(state_get last-result)" == failed* ]]; then
+            # Host and state agree and nothing is marked: the failure is history.
+            state_clear failed-notified
+            state_set last-result "adopted $ver ($(date -Is))"
+            echo "$APP: the earlier failed result is replaced"
+        fi
     fi
 
     echo "$APP: checks (relrotate doctor $APP)"
